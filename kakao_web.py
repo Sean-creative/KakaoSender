@@ -113,6 +113,21 @@ tell application "System Events"
 end tell
 '''
 
+# 검색창 초기화 (다음 검색을 위해)
+SCRIPT_RESET_SEARCH = '''
+tell application "KakaoTalk" to activate
+delay 0.3
+tell application "System Events"
+  -- Esc 여러 번 눌러서 모든 창/검색 닫기
+  key code 53
+  delay 0.2
+  key code 53
+  delay 0.2
+  key code 53
+  delay 0.3
+end tell
+'''
+
 # ============================================================
 # HTML 템플릿
 # ============================================================
@@ -535,6 +550,13 @@ def send_message(name: str, message: str) -> bool:
     except Exception as e:
         log(f"   -> ❌ 오류 발생: {e}")
         return False
+    finally:
+        # 성공/실패 관계없이 다음 검색을 위해 검색창 초기화
+        try:
+            run_applescript(SCRIPT_RESET_SEARCH)
+            time.sleep(0.3)
+        except:
+            pass
 
 
 def run_sending_logic():

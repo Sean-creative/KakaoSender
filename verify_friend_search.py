@@ -48,6 +48,27 @@ def go_to_friend_list():
     '''
     run_applescript(script)
 
+def reset_for_next_search():
+    """다음 검색을 위해 검색창 초기화 및 친구 목록으로 복귀"""
+    script = '''
+    tell application "KakaoTalk" to activate
+    delay 0.3
+    tell application "System Events"
+        -- 1. 여러 번 Esc로 모든 창/팝업/검색창 닫기
+        key code 53
+        delay 0.2
+        key code 53
+        delay 0.2
+        key code 53
+        delay 0.3
+        
+        -- 2. 친구 목록으로 이동 (Cmd+1)
+        keystroke "1" using command down
+        delay 0.5
+    end tell
+    '''
+    run_applescript(script)
+
 def search_friend(name):
     pyperclip.copy(name)
     script = f'''
@@ -252,6 +273,9 @@ def main():
         if not window_id:
             print("   ❌ KakaoTalk Window Not Found")
             fail_count += 1
+            # 다음 검색을 위해 초기화
+            reset_for_next_search()
+            time.sleep(1)
             continue
             
         texts = capture_and_read(window_id)
@@ -283,14 +307,10 @@ def main():
             
         else:
             print(f"   ❌ Not Found (Density Lines: {meaningful_line_count}). Skipping.")
-            # 실패 시에도 검색창은 닫아줘야 다음 루프가 깔끔함
-            # 검색창 닫기 (Esc)
-            run_applescript('''
-            tell application "System Events"
-                key code 53
-            end tell
-            ''')
             fail_count += 1
+            
+        # 성공/실패 관계없이 다음 검색을 위해 검색창 초기화
+        reset_for_next_search()
             
         time.sleep(1) # Interval
         
