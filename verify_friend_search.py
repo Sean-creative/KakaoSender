@@ -54,11 +54,12 @@ def reset_for_next_search():
     tell application "KakaoTalk" to activate
     delay 0.3
     tell application "System Events"
-        -- 1. 여러 번 Esc로 모든 창/팝업/검색창 닫기
-        key code 53
+        tell process "KakaoTalk"
+            set frontmost to true
+        end tell
         delay 0.2
-        key code 53
-        delay 0.2
+        
+        -- 1. Esc 한 번만 (검색창/채팅창 닫기)
         key code 53
         delay 0.3
         
@@ -69,26 +70,71 @@ def reset_for_next_search():
     '''
     run_applescript(script)
 
+def ensure_kakaotalk_ready():
+    """카카오톡이 활성화되어 있고 창이 열려있는지 확인, 필요시 재시도"""
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        # 카카오톡 활성화
+        script = '''
+        tell application "KakaoTalk"
+            activate
+            delay 0.5
+        end tell
+        tell application "System Events"
+            tell process "KakaoTalk"
+                set frontmost to true
+                -- 창이 없으면 새 창 열기 시도
+                if (count of windows) is 0 then
+                    keystroke "n" using command down
+                    delay 0.5
+                end if
+            end tell
+        end tell
+        '''
+        run_applescript(script)
+        time.sleep(0.5)
+        
+        # 창 확인
+        window_id = get_kakaotalk_window_id()
+        if window_id:
+            return window_id
+        
+        print(f"   ⚠️ 카카오톡 창 찾기 재시도 ({attempt + 1}/{max_retries})...")
+        time.sleep(1)
+    
+    return None
+
 def search_friend(name):
     pyperclip.copy(name)
     script = f'''
+    -- 카카오톡 확실히 활성화
     tell application "KakaoTalk" to activate
-    delay 0.5
+    delay 0.3
     
     tell application "System Events"
-        -- 1. 검색창 열기 (Cmd+F)
+        tell process "KakaoTalk"
+            set frontmost to true
+        end tell
+        delay 0.3
+        
+        -- 1. 먼저 친구 목록으로 이동 (Cmd+1) - 안전장치
+        keystroke "1" using command down
+        delay 0.3
+        
+        -- 2. 검색창 열기 (Cmd+F)
         key code 3 using command down
         delay 0.5
         
-        -- 2. 기존 검색어 전체 선택 (Cmd+A)
+        -- 3. 기존 검색어 전체 선택 (Cmd+A)
         key code 0 using command down
         delay 0.2
         
-        -- 3. 삭제 (Backspace)
+        -- 4. 삭제 (Backspace)
         key code 51
         delay 0.3
         
-        -- 4. 메뉴 클릭으로 붙여넣기 (Tell Process 필수!)
+        -- 5. 메뉴 클릭으로 붙여넣기 (Tell Process 필수!)
         tell process "KakaoTalk"
             set frontmost to true
             try
@@ -105,7 +151,7 @@ def search_friend(name):
         end tell
         delay 1.0
         
-        -- 5. 아래 화살표 (검색 결과로 이동)
+        -- 6. 아래 화살표 (검색 결과로 이동)
         key code 125
         delay 0.2
         key code 125
@@ -264,12 +310,20 @@ def main():
         
         print(f"\n[{idx+1}/{total_count}] Processing: {name} ...")
         
+        # A-0. 검색 전 카카오톡 활성화 확인
+        pre_window_id = ensure_kakaotalk_ready()
+        if not pre_window_id:
+            print("   ❌ 카카오톡 창을 열 수 없습니다. 건너뜁니다.")
+            fail_count += 1
+            time.sleep(1)
+            continue
+        
         # A. 검색
         search_friend(name)
         time.sleep(1.5) # 검색 결과 로딩 대기
         
         # B. 검증 (OCR)
-        window_id = get_kakaotalk_window_id()
+        window_id = ensure_kakaotalk_ready()
         if not window_id:
             print("   ❌ KakaoTalk Window Not Found")
             fail_count += 1
