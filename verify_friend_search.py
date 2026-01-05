@@ -280,6 +280,11 @@ def main():
             
         texts = capture_and_read(window_id)
         
+        # OCR 결과 콘솔 출력
+        print(f"   📷 OCR 결과 (총 {len(texts)}개):")
+        for i, t in enumerate(texts):
+            print(f"      [{i+1}] {t}")
+        
         # B-1. 필터링 로직
         filtered_texts = []
         for t in texts:
@@ -288,6 +293,9 @@ def main():
             if t_clean.startswith("Q") and name in t_clean: continue
             if t_clean == name: continue
             filtered_texts.append(t_clean)
+        
+        # 필터링 후 결과도 출력
+        print(f"   🔍 필터링 후 ({len(filtered_texts)}개): {filtered_texts}")
             
         # B-2. 판단
         found_by_name = any(name in ft for ft in filtered_texts)
