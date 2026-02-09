@@ -20,10 +20,28 @@ fi
 
 # 필요한 패키지 확인 및 설치
 echo "📦 필요한 패키지 확인 중..."
+
+# 기본 패키지 확인
 python3 -c "import pandas, pyperclip, flask" 2>/dev/null
-if [ $? -ne 0 ]; then
+BASIC_OK=$?
+
+# OCR 패키지 확인 (친구 검증용)
+python3 -c "import Quartz, Vision" 2>/dev/null
+OCR_OK=$?
+
+if [ $BASIC_OK -ne 0 ] || [ $OCR_OK -ne 0 ]; then
     echo "📥 패키지 설치 중... (최초 1회만 필요)"
-    pip3 install pandas pyperclip openpyxl flask --quiet
+    
+    if [ $BASIC_OK -ne 0 ]; then
+        echo "   - 기본 패키지 설치 중..."
+        pip3 install pandas pyperclip openpyxl flask --quiet
+    fi
+    
+    if [ $OCR_OK -ne 0 ]; then
+        echo "   - OCR 패키지 설치 중... (시간이 다소 걸립니다)"
+        pip3 install pyobjc --quiet
+    fi
+    
     echo "✅ 패키지 설치 완료!"
 fi
 

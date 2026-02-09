@@ -9,6 +9,7 @@ import sys
 import subprocess
 import threading
 import time
+import random
 import webbrowser
 from queue import Queue
 from datetime import datetime
@@ -23,20 +24,29 @@ import Vision
 # ============================================================
 # 설정
 # ============================================================
+VERSION = "1.0.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 타겟 멤버 필터링 조건
-TARGET_REGISTER_TYPES = ['이월', '재등록', '신규']
-TARGET_AGE_GROUPS = ['20대', '30대']
+# 선택 가능한 필터 옵션
+AVAILABLE_REGISTER_TYPES = ['이월', '재등록', '신규']
+AVAILABLE_AGE_GROUPS = ['10대', '20대', '30대', '40대', '50대', '60대 이상']
 
-# 메시지 템플릿
-MESSAGE_TEMPLATE = "{name}님!\n요청하신 리포트입니다.\n감사합니다."
+# 기본 선택값
+DEFAULT_REGISTER_TYPES = ['이월', '재등록', '신규']
+DEFAULT_AGE_GROUPS = ['20대', '30대']
+
+# 기본 메시지 템플릿
+DEFAULT_MESSAGE_TEMPLATE = "{name}님!\n요청하신 리포트입니다.\n감사합니다."
 
 # Flask 앱
 app = Flask(__name__)
 log_queue = Queue()
 is_running = False
+stop_requested = False
 current_file_path = None
+current_register_types = None
+current_age_groups = None
+current_message_template = None
 
 
 @app.errorhandler(Exception)
@@ -76,13 +86,17 @@ tell application "System Events"
     end tell
     delay 0.2
     
-    -- 1. Esc 한 번만 (검색창/채팅창 닫기)
+    -- 1. Esc 3회 (채팅창/검색창/알림 등 모든 레이어 닫기)
+    key code 53
+    delay 0.3
+    key code 53
+    delay 0.3
     key code 53
     delay 0.3
     
     -- 2. 친구 목록으로 이동 (Cmd+1)
     keystroke "1" using command down
-    delay 0.5
+    delay 0.8
 end tell
 '''
 
@@ -190,23 +204,27 @@ def search_friend(name: str):
         end tell
         delay 0.3
         
-        -- 1. 먼저 친구 목록으로 이동 (Cmd+1) - 안전장치
-        keystroke "1" using command down
+        -- 1. Esc로 혹시 남아있는 채팅창/검색창 닫기
+        key code 53
         delay 0.3
         
-        -- 2. 검색창 열기 (Cmd+F)
+        -- 2. 친구 목록으로 이동 (Cmd+1) - 채팅창이 아닌 친구 목록에서 검색 보장
+        keystroke "1" using command down
+        delay 0.5
+        
+        -- 3. 검색창 열기 (Cmd+F)
         key code 3 using command down
         delay 0.5
         
-        -- 3. 기존 검색어 전체 선택 (Cmd+A)
+        -- 4. 기존 검색어 전체 선택 (Cmd+A)
         key code 0 using command down
         delay 0.2
         
-        -- 4. 삭제 (Backspace)
+        -- 5. 삭제 (Backspace)
         key code 51
         delay 0.3
         
-        -- 5. 메뉴 클릭으로 붙여넣기 (Tell Process 필수!)
+        -- 6. 메뉴 클릭으로 붙여넣기 (Tell Process 필수!)
         tell process "KakaoTalk"
             set frontmost to true
             try
@@ -223,7 +241,7 @@ def search_friend(name: str):
         end tell
         delay 1.0
         
-        -- 6. 아래 화살표 (검색 결과로 이동)
+        -- 7. 아래 화살표 (검색 결과로 이동)
         key code 125
         delay 0.2
         key code 125
@@ -234,17 +252,17 @@ def search_friend(name: str):
 
 
 def verify_friend_by_ocr(name: str, window_id: int) -> bool:
-    """OCR로 친구 검증 - 이름이 최소 2번 나와야 찾은 것으로 인식"""
+    """OCR로 친구 검증 - 이름이 완전히 일치하는 텍스트가 최소 1개 이상 있어야 찾은 것으로 인식"""
     texts = capture_and_read(window_id)
     
-    # 이름이 포함된 텍스트 카운트
+    # 이름이 완전히 일치하는 텍스트 카운트
     name_count = 0
     for t in texts:
-        if name in t:
+        if name.strip() == t.strip():  # 완전 일치 (앞뒤 공백 제거 후 비교)
             name_count += 1
     
-    # 최소 2번 이상 나와야 친구를 찾은 것으로 인식
-    return name_count >= 2
+    # 최소 1번 이상 완전 일치해야 친구를 찾은 것으로 인식
+    return name_count >= 1
 
 
 def send_message_to_friend(message: str):
@@ -340,30 +358,57 @@ HTML_TEMPLATE = '''
         .content {
             padding: 30px;
         }
-        .filter-info {
+        .section {
             background: #f8f9fa;
             border-radius: 12px;
             padding: 20px;
-            margin-bottom: 25px;
+            margin-bottom: 20px;
         }
-        .filter-info h3 {
+        .section h3 {
             color: #333;
             margin-bottom: 15px;
             font-size: 16px;
         }
-        .filter-item {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin: 8px 0;
-            color: #555;
+        .filter-group {
+            margin-bottom: 15px;
         }
-        .filter-item .badge {
+        .filter-group:last-child {
+            margin-bottom: 0;
+        }
+        .filter-label {
+            display: inline-block;
             background: #28a745;
             color: white;
             padding: 4px 10px;
             border-radius: 15px;
             font-size: 12px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .toggle-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .toggle-btn {
+            padding: 8px 16px;
+            border: 2px solid #ddd;
+            border-radius: 20px;
+            background: white;
+            color: #555;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+            user-select: none;
+        }
+        .toggle-btn:hover {
+            border-color: #667eea;
+            color: #667eea;
+        }
+        .toggle-btn.active {
+            border-color: #667eea;
+            background: #667eea;
+            color: white;
         }
         .upload-area {
             border: 2px dashed #ddd;
@@ -382,6 +427,11 @@ HTML_TEMPLATE = '''
             border-color: #28a745;
             background: #f0fff4;
         }
+        .upload-area.drag-over {
+            border-color: #667eea;
+            background: #e8ebff;
+            transform: scale(1.02);
+        }
         .upload-area input[type="file"] {
             display: none;
         }
@@ -393,6 +443,44 @@ HTML_TEMPLATE = '''
             color: #28a745;
             font-weight: bold;
             margin-top: 10px;
+        }
+        .message-section {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .message-section h3 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+        .message-hint {
+            color: #888;
+            font-size: 12px;
+            margin-bottom: 10px;
+        }
+        .message-hint code {
+            background: #e9ecef;
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: #667eea;
+            font-weight: bold;
+        }
+        .message-textarea {
+            width: 100%;
+            min-height: 100px;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 14px;
+            resize: vertical;
+            transition: border-color 0.3s;
+        }
+        .message-textarea:focus {
+            outline: none;
+            border-color: #667eea;
         }
         .btn {
             width: 100%;
@@ -414,6 +502,18 @@ HTML_TEMPLATE = '''
         }
         .btn-start:disabled {
             background: #ccc;
+            cursor: not-allowed;
+        }
+        .btn-stop {
+            background: #dc3545;
+            color: white;
+        }
+        .btn-stop:hover:not(:disabled) {
+            background: #c82333;
+            transform: translateY(-2px);
+        }
+        .btn-stop:disabled {
+            background: #e4606d;
             cursor: not-allowed;
         }
         .log-area {
@@ -483,23 +583,48 @@ HTML_TEMPLATE = '''
             <h1>카카오톡 자동 전송기</h1>
         </div>
         <div class="content">
-            <div class="filter-info">
+            <!-- 필터링 조건 선택 -->
+            <div class="section">
                 <h3>📌 타겟 멤버 필터링 조건</h3>
-                <div class="filter-item">
-                    <span class="badge">등록형태</span>
-                    <span>{{ register_types }}</span>
+                <div class="filter-group">
+                    <span class="filter-label">등록형태</span>
+                    <div class="toggle-buttons" id="registerTypeButtons">
+                        {% for rt in available_register_types %}
+                        <button type="button" class="toggle-btn {% if rt in default_register_types %}active{% endif %}"
+                                onclick="toggleFilter(this)" data-value="{{ rt }}">{{ rt }}</button>
+                        {% endfor %}
+                    </div>
                 </div>
-                <div class="filter-item">
-                    <span class="badge">연령</span>
-                    <span>{{ age_groups }}</span>
+                <div class="filter-group">
+                    <span class="filter-label">연령대</span>
+                    <div class="toggle-buttons" id="ageGroupButtons">
+                        {% for ag in available_age_groups %}
+                        <button type="button" class="toggle-btn {% if ag in default_age_groups %}active{% endif %}"
+                                onclick="toggleFilter(this)" data-value="{{ ag }}">{{ ag }}</button>
+                        {% endfor %}
+                    </div>
                 </div>
             </div>
-            
-            <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
+
+            <!-- 엑셀 파일 업로드 -->
+            <div class="upload-area" id="uploadArea" 
+                 onclick="document.getElementById('fileInput').click()"
+                 ondragover="handleDragOver(event)"
+                 ondragleave="handleDragLeave(event)"
+                 ondrop="handleDrop(event)">
                 <div class="upload-icon">📁</div>
-                <div>엑셀 파일을 선택하세요 (.xlsx)</div>
+                <div>엑셀 파일을 선택하거나 드래그하세요 (.xlsx)</div>
                 <div class="file-name" id="fileName"></div>
                 <input type="file" id="fileInput" accept=".xlsx" onchange="handleFileSelect(this)">
+            </div>
+
+            <!-- 발송 메시지 입력 -->
+            <div class="message-section">
+                <h3>✏️ 발송 메시지</h3>
+                <div class="message-hint">
+                    <code>{name}</code> 입력 시 회원 이름으로 자동 치환됩니다
+                </div>
+                <textarea class="message-textarea" id="messageText">{{ default_message }}</textarea>
             </div>
             
             <span class="status-badge status-idle" id="statusBadge">대기 중</span>
@@ -507,17 +632,61 @@ HTML_TEMPLATE = '''
             <button class="btn btn-start" id="startBtn" disabled onclick="startSending()">
                 🚀 카카오톡 전송 시작
             </button>
+            <button class="btn btn-stop" id="stopBtn" style="display:none;" onclick="stopSending()">
+                ⏹ 전송 중단
+            </button>
             
             <div class="log-area" id="logArea"></div>
         </div>
         <div class="footer">
-            카카오톡 자동 전송기 v1.0 | 전송 중 마우스/키보드 조작 금지
+            카카오톡 자동 전송기 v{{ version }} | 전송 중 마우스/키보드 조작 금지
         </div>
     </div>
 
     <script>
         let selectedFile = null;
         let eventSource = null;
+        
+        function toggleFilter(btn) {
+            btn.classList.toggle('active');
+        }
+        
+        function getSelectedValues(containerId) {
+            const buttons = document.querySelectorAll('#' + containerId + ' .toggle-btn.active');
+            return Array.from(buttons).map(btn => btn.dataset.value);
+        }
+        
+        function handleDragOver(event) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.currentTarget.classList.add('drag-over');
+        }
+        
+        function handleDragLeave(event) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.currentTarget.classList.remove('drag-over');
+        }
+        
+        function handleDrop(event) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.currentTarget.classList.remove('drag-over');
+            
+            const files = event.dataTransfer.files;
+            if (files.length > 0) {
+                const file = files[0];
+                if (file.name.endsWith('.xlsx')) {
+                    // FileList를 FileInput에 할당하기 위해 DataTransfer 사용
+                    const dataTransfer = new DataTransfer();
+                    dataTransfer.items.add(file);
+                    document.getElementById('fileInput').files = dataTransfer.files;
+                    handleFileSelect(document.getElementById('fileInput'));
+                } else {
+                    alert('엑셀 파일(.xlsx)만 업로드 가능합니다.');
+                }
+            }
+        }
         
         function handleFileSelect(input) {
             if (input.files.length > 0) {
@@ -541,10 +710,30 @@ HTML_TEMPLATE = '''
         function startSending() {
             if (!selectedFile) return;
             
+            const registerTypes = getSelectedValues('registerTypeButtons');
+            const ageGroups = getSelectedValues('ageGroupButtons');
+            const messageText = document.getElementById('messageText').value;
+            
+            if (registerTypes.length === 0) {
+                alert('등록형태를 최소 1개 이상 선택해주세요.');
+                return;
+            }
+            if (ageGroups.length === 0) {
+                alert('연령대를 최소 1개 이상 선택해주세요.');
+                return;
+            }
+            if (!messageText.trim()) {
+                alert('발송 메시지를 입력해주세요.');
+                return;
+            }
+            
             const formData = new FormData();
             formData.append('file', selectedFile);
             
-            document.getElementById('startBtn').disabled = true;
+            document.getElementById('startBtn').style.display = 'none';
+            document.getElementById('stopBtn').style.display = 'block';
+            document.getElementById('stopBtn').disabled = false;
+            document.getElementById('stopBtn').textContent = '⏹ 전송 중단';
             document.getElementById('statusBadge').className = 'status-badge status-running';
             document.getElementById('statusBadge').textContent = '전송 중...';
             
@@ -558,7 +747,15 @@ HTML_TEMPLATE = '''
                 if (data.success) {
                     addLog('🚀 작업을 시작합니다...', 'info');
                     startLogStream();
-                    fetch('/start', { method: 'POST' });
+                    fetch('/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            register_types: registerTypes,
+                            age_groups: ageGroups,
+                            message_template: messageText
+                        })
+                    });
                 } else {
                     addLog('❌ 오류: ' + data.error, 'error');
                     resetUI();
@@ -568,6 +765,12 @@ HTML_TEMPLATE = '''
                 addLog('❌ 업로드 실패: ' + error, 'error');
                 resetUI();
             });
+        }
+        
+        function stopSending() {
+            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('stopBtn').textContent = '⏹ 중단 중...';
+            fetch('/stop', { method: 'POST' });
         }
         
         function startLogStream() {
@@ -583,14 +786,16 @@ HTML_TEMPLATE = '''
                     let logType = '';
                     if (data.message.includes('✅') || data.message.includes('성공')) logType = 'success';
                     else if (data.message.includes('❌') || data.message.includes('실패')) logType = 'error';
-                    else if (data.message.includes('⚠️')) logType = 'warning';
+                    else if (data.message.includes('⚠️') || data.message.includes('중단')) logType = 'warning';
                     else if (data.message.includes('🚀') || data.message.includes('📋')) logType = 'info';
                     
                     addLog(data.message, logType);
                 } else if (data.type === 'complete') {
                     eventSource.close();
                     resetUI();
-                    if (data.failed_names && data.failed_names.length > 0) {
+                    if (data.stopped) {
+                        alert('전송이 중단되었습니다.\\n\\n성공: ' + data.success + '/' + data.total);
+                    } else if (data.failed_names && data.failed_names.length > 0) {
                         alert('완료!\\n\\n성공: ' + data.success + '/' + data.total + 
                               '\\n\\n실패한 대상자:\\n• ' + data.failed_names.join('\\n• '));
                     } else {
@@ -606,7 +811,9 @@ HTML_TEMPLATE = '''
         }
         
         function resetUI() {
+            document.getElementById('startBtn').style.display = 'block';
             document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').style.display = 'none';
             document.getElementById('statusBadge').className = 'status-badge status-idle';
             document.getElementById('statusBadge').textContent = '대기 중';
         }
@@ -623,8 +830,12 @@ HTML_TEMPLATE = '''
 def index():
     return render_template_string(
         HTML_TEMPLATE,
-        register_types=', '.join(TARGET_REGISTER_TYPES),
-        age_groups=', '.join(TARGET_AGE_GROUPS)
+        available_register_types=AVAILABLE_REGISTER_TYPES,
+        available_age_groups=AVAILABLE_AGE_GROUPS,
+        default_register_types=DEFAULT_REGISTER_TYPES,
+        default_age_groups=DEFAULT_AGE_GROUPS,
+        default_message=DEFAULT_MESSAGE_TEMPLATE,
+        version=VERSION
     )
 
 
@@ -652,15 +863,29 @@ def upload_file():
 
 @app.route('/start', methods=['POST'])
 def start_sending():
-    global is_running
+    global is_running, stop_requested
+    global current_register_types, current_age_groups, current_message_template
     
     if is_running:
         return jsonify({'success': False, 'error': '이미 실행 중입니다'})
     
+    data = request.get_json() or {}
+    current_register_types = data.get('register_types', DEFAULT_REGISTER_TYPES)
+    current_age_groups = data.get('age_groups', DEFAULT_AGE_GROUPS)
+    current_message_template = data.get('message_template', DEFAULT_MESSAGE_TEMPLATE)
+    
     is_running = True
+    stop_requested = False
     thread = threading.Thread(target=run_sending_logic, daemon=True)
     thread.start()
     
+    return jsonify({'success': True})
+
+
+@app.route('/stop', methods=['POST'])
+def stop_sending():
+    global stop_requested
+    stop_requested = True
     return jsonify({'success': True})
 
 
@@ -686,27 +911,64 @@ def log(msg):
     log_queue.put(json.dumps({'type': 'log', 'message': msg}))
 
 
+class StopRequestedException(Exception):
+    """전송 중단 요청 예외"""
+    pass
+
+
+def check_stop_requested():
+    """중단 요청 확인, 중단 요청 시 예외 발생"""
+    if stop_requested:
+        raise StopRequestedException("사용자에 의해 전송이 중단되었습니다")
+
+
+def safe_sleep(duration_range, show_log=False):
+    """중단 체크를 포함한 랜덤 대기
+    
+    Args:
+        duration_range: (min, max) 튜플로 대기 시간 범위 지정
+        show_log: True일 경우 대기 시간을 로그에 표시
+    """
+    check_stop_requested()
+    delay = random.uniform(*duration_range)
+    if show_log:
+        log(f"   -> ⏳ {delay:.1f}초 대기...")
+    elapsed = 0
+    step = 0.1  # 0.1초마다 체크
+    while elapsed < delay:
+        time.sleep(min(step, delay - elapsed))
+        elapsed += step
+        check_stop_requested()
+
+
 def send_message(name: str, message: str) -> bool:
     """카카오톡 메시지 전송 (OCR 검증 포함)"""
     try:
+        check_stop_requested()
+        
         # 1. 카카오톡 활성화 및 준비 확인
         window_id = ensure_kakaotalk_ready()
+        check_stop_requested()
         if not window_id:
             log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
             return False
 
         # 2. 친구 검색
         log(f"   -> 📋 '{name}' 검색 중...")
+        check_stop_requested()
         search_friend(name)
-        time.sleep(1.5)  # 검색 결과 로딩 대기
+        safe_sleep((1.0, 2.0))  # 검색 결과 로딩 대기 (랜덤, 중단 체크 포함)
         
         # 3. OCR 검증
+        check_stop_requested()
         window_id = ensure_kakaotalk_ready()
+        check_stop_requested()
         if not window_id:
             log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
             return False
         
         log(f"   -> 🔍 OCR 검증 중...")
+        check_stop_requested()
         if not verify_friend_by_ocr(name, window_id):
             log(f"   -> ❌ '{name}' 친구를 찾을 수 없습니다. (OCR 검증 실패)")
             return False
@@ -714,37 +976,50 @@ def send_message(name: str, message: str) -> bool:
         log(f"   -> ✅ '{name}' 친구 확인됨!")
 
         # 4. 메시지 전송
+        check_stop_requested()
         log(f"   -> 📤 메시지 전송 중...")
         send_message_to_friend(message)
-        time.sleep(0.5)
+        safe_sleep((0.3, 0.8))  # 전송 후 대기 (랜덤, 중단 체크 포함)
         log(f"   -> ✅ 전송 완료!")
         return True
         
+    except StopRequestedException:
+        log(f"   -> ⏹ 전송 중단됨")
+        raise  # 상위로 전파하여 즉시 중단
     except Exception as e:
         log(f"   -> ❌ 오류 발생: {e}")
         return False
     finally:
-        # 성공/실패 관계없이 다음 검색을 위해 검색창 초기화
-        try:
-            run_applescript(SCRIPT_RESET_SEARCH)
-            time.sleep(0.3)
-        except:
-            pass
+        # 성공/실패 관계없이 다음 검색을 위해 검색창 초기화 (중단 요청이 아닌 경우에만)
+        if not stop_requested:
+            try:
+                run_applescript(SCRIPT_RESET_SEARCH)
+                # 중단 요청이 없을 때만 대기
+                if not stop_requested:
+                    time.sleep(random.uniform(0.2, 0.5))
+            except:
+                pass
 
 
 def run_sending_logic():
     """메인 전송 로직"""
-    global is_running
+    global is_running, stop_requested
     import json
     
     try:
         df = pd.read_excel(current_file_path)
         log(f"📊 전체 {len(df)}명 로드됨")
         
-        # 타겟 멤버 필터링
+        # 선택된 필터로 타겟 멤버 필터링
+        register_types = current_register_types or DEFAULT_REGISTER_TYPES
+        age_groups = current_age_groups or DEFAULT_AGE_GROUPS
+        message_template = current_message_template or DEFAULT_MESSAGE_TEMPLATE
+        
+        log(f"📌 필터 - 등록형태: {', '.join(register_types)} / 연령대: {', '.join(age_groups)}")
+        
         target_df = df[
-            (df['등록형태'].isin(TARGET_REGISTER_TYPES)) &
-            (df['연령'].isin(TARGET_AGE_GROUPS))
+            (df['등록형태'].isin(register_types)) &
+            (df['연령'].isin(age_groups))
         ]
         
         count = len(target_df)
@@ -756,28 +1031,48 @@ def run_sending_logic():
                 'type': 'complete',
                 'success': 0,
                 'total': 0,
-                'failed_names': []
+                'failed_names': [],
+                'stopped': False
             }))
             return
         
         success_count = 0
         failed_names = []
+        stopped = False
         
         for i, (_, row) in enumerate(target_df.iterrows()):
+            # 중단 요청 확인
+            check_stop_requested()
+            
             name = row['이름']
-            message = MESSAGE_TEMPLATE.format(name=name)
+            message = message_template.format(name=name)
             
             log(f"[{i + 1}/{count}] {name}님 처리 중...")
             
-            if send_message(name, message):
-                success_count += 1
-            else:
-                failed_names.append(name)
+            try:
+                if send_message(name, message):
+                    success_count += 1
+                else:
+                    failed_names.append(name)
+            except StopRequestedException:
+                log(f"\n⚠️ 사용자에 의해 전송이 중단되었습니다. ({i}/{count} 처리됨)")
+                stopped = True
+                break
             
-            time.sleep(2)
+            # 매크로 탐지 방지를 위한 랜덤 대기 (1~3초, 중단 체크 포함)
+            check_stop_requested()
+            try:
+                safe_sleep((1.0, 3.0), show_log=True)
+            except StopRequestedException:
+                log(f"\n⚠️ 사용자에 의해 전송이 중단되었습니다. ({i + 1}/{count} 처리됨)")
+                stopped = True
+                break
         
         log(f"\n{'='*40}")
-        log(f"🎉 완료! (성공: {success_count}/{count})")
+        if stopped:
+            log(f"⚠️ 중단됨! (성공: {success_count}/{count})")
+        else:
+            log(f"🎉 완료! (성공: {success_count}/{count})")
         
         if failed_names:
             log(f"\n❌ 실패한 타겟 멤버 ({len(failed_names)}명):")
@@ -790,7 +1085,8 @@ def run_sending_logic():
             'type': 'complete',
             'success': success_count,
             'total': count,
-            'failed_names': failed_names
+            'failed_names': failed_names,
+            'stopped': stopped
         }))
         
     except Exception as e:
@@ -799,10 +1095,12 @@ def run_sending_logic():
             'type': 'complete',
             'success': 0,
             'total': 0,
-            'failed_names': []
+            'failed_names': [],
+            'stopped': False
         }))
     finally:
         is_running = False
+        stop_requested = False
 
 
 # ============================================================
