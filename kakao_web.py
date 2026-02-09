@@ -1036,6 +1036,54 @@ def run_sending_logic():
             }))
             return
         
+        # 전송 시작 전 카카오톡 사전 준비
+        log("💬 카카오톡 준비 중...")
+        
+        window_id = None
+        max_prepare_retries = 5  # 최대 5회 시도 (카카오톡이 꺼져있을 경우 시작까지 시간 필요)
+        
+        for attempt in range(max_prepare_retries):
+            run_applescript('''
+            tell application "KakaoTalk"
+                activate
+                delay 2.0
+            end tell
+            tell application "System Events"
+                tell process "KakaoTalk"
+                    set frontmost to true
+                    if (count of windows) is 0 then
+                        keystroke "n" using command down
+                        delay 1.0
+                    end if
+                end tell
+            end tell
+            ''')
+            time.sleep(2)
+            
+            window_id = get_kakaotalk_window_id()
+            if window_id:
+                break
+            
+            log(f"   -> 카카오톡 창 대기 중... ({attempt + 1}/{max_prepare_retries})")
+            time.sleep(2)
+        
+        if not window_id:
+            log("❌ 카카오톡을 찾을 수 없습니다. 카카오톡이 설치되어 있고 로그인되어 있는지 확인해주세요.")
+            log_queue.put(json.dumps({
+                'type': 'complete',
+                'success': 0,
+                'total': count,
+                'failed_names': [],
+                'stopped': False
+            }))
+            return
+        
+        log("✅ 카카오톡 준비 완료!")
+        
+        # 친구 목록으로 이동
+        run_applescript(SCRIPT_RESET_SEARCH)
+        time.sleep(1)
+        
         success_count = 0
         failed_names = []
         stopped = False
