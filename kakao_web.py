@@ -364,9 +364,15 @@ HTML_TEMPLATE = '''
             padding: 20px;
             margin-bottom: 20px;
         }
-        .section h3 {
-            color: #333;
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             margin-bottom: 15px;
+        }
+        .section-header h3 {
+            color: #333;
+            margin: 0;
             font-size: 16px;
         }
         .filter-group {
@@ -409,6 +415,24 @@ HTML_TEMPLATE = '''
             border-color: #667eea;
             background: #667eea;
             color: white;
+        }
+        .filter-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .btn-filter-action {
+            padding: 6px 14px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            background: white;
+            color: #555;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-filter-action:hover {
+            border-color: #667eea;
+            color: #667eea;
         }
         .upload-area {
             border: 2px dashed #ddd;
@@ -585,7 +609,13 @@ HTML_TEMPLATE = '''
         <div class="content">
             <!-- 필터링 조건 선택 -->
             <div class="section">
-                <h3>📌 타겟 멤버 필터링 조건</h3>
+                <div class="section-header">
+                    <h3>📌 타겟 멤버 필터링 조건</h3>
+                    <div class="filter-actions">
+                        <button type="button" class="btn-filter-action" onclick="selectAllFilters()">전체선택</button>
+                        <button type="button" class="btn-filter-action" onclick="resetFilters()">초기화</button>
+                    </div>
+                </div>
                 <div class="filter-group">
                     <span class="filter-label">등록형태</span>
                     <div class="toggle-buttons" id="registerTypeButtons">
@@ -649,6 +679,18 @@ HTML_TEMPLATE = '''
         
         function toggleFilter(btn) {
             btn.classList.toggle('active');
+        }
+        
+        function selectAllFilters() {
+            document.querySelectorAll('#registerTypeButtons .toggle-btn, #ageGroupButtons .toggle-btn').forEach(btn => {
+                btn.classList.add('active');
+            });
+        }
+        
+        function resetFilters() {
+            document.querySelectorAll('#registerTypeButtons .toggle-btn, #ageGroupButtons .toggle-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
         }
         
         function getSelectedValues(containerId) {
