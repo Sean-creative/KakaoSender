@@ -1035,7 +1035,24 @@ def run_sending_logic():
                 'stopped': False
             }))
             return
-        
+
+        # 동명이인 체크 (앞뒤 공백 제거 후 비교)
+        normalized_names = target_df['이름'].str.strip()
+        duplicated_names = normalized_names[normalized_names.duplicated(keep=False)].unique().tolist()
+        if duplicated_names:
+            names_str = ', '.join(duplicated_names)
+            log(f"❌ 동명이인 오류: 전송 대상에 같은 이름이 존재합니다 → {names_str}")
+            log("🚫 동명이인이 있을 경우 카카오톡 검색 오류가 발생할 수 있어 전송을 중단합니다.")
+            log("📋 엑셀 파일에서 해당 이름의 중복 여부를 확인한 후 다시 시도해주세요.")
+            log_queue.put(json.dumps({
+                'type': 'complete',
+                'success': 0,
+                'total': count,
+                'failed_names': [],
+                'stopped': True
+            }))
+            return
+
         # 전송 시작 전 카카오톡 사전 준비
         log("💬 카카오톡 준비 중...")
         
