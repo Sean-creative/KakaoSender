@@ -1136,6 +1136,17 @@ def run_sending_logic():
                 'stopped': False
             }))
             return
+
+        # 카카오톡 창 크기 조정 (긴 이름 OCR 인식용: 1400x900)
+        run_applescript('''
+        tell application "System Events"
+            tell process "KakaoTalk"
+                set frontmost to true
+                set size of window 1 to {1400, 900}
+            end tell
+        end tell
+        ''')
+        time.sleep(0.5)
         
         log("✅ 카카오톡 준비 완료!")
         
