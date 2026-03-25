@@ -6,6 +6,8 @@
 
 import os
 import sys
+import re
+import tempfile
 import subprocess
 import threading
 import time
@@ -26,9 +28,11 @@ import Vision
 # ============================================================
 VERSION = "1.0.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 업로드 파일은 스크립트 폴더가 아닌 시스템 임시 디렉터리에 저장 (폴더명 공백·복사본 경로 등으로 인한 ENOENT 방지)
+UPLOAD_TEMP_XLSX = os.path.join(tempfile.gettempdir(), f'kakao_sender_upload_{os.getpid()}.xlsx')
 
 # 선택 가능한 필터 옵션
-AVAILABLE_REGISTER_TYPES = ['이월', '재등록', '신규']
+AVAILABLE_REGISTER_TYPES = ['이월', '재등록', '신규', '이탈', '이탈(단)']
 AVAILABLE_AGE_GROUPS = ['10대', '20대', '30대', '40대', '50대', '60대 이상']
 
 # 기본 선택값
@@ -69,6 +73,34 @@ def run_applescript(script: str) -> tuple:
     return proc.returncode, out.decode('utf-8'), err.decode('utf-8')
 
 
+# 주의: U+24C2~U+1F251 같은 넓은 범위는 한글 음절(U+AC00~)까지 포함해 이름이 전부 지워짐
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"  # Emoticons
+    "\U0001F300-\U0001F5FF"  # Symbols & Pictographs
+    "\U0001F680-\U0001F6FF"  # Transport & Map
+    "\U0001F1E0-\U0001F1FF"  # Flags
+    "\U00002702-\U000027B0"
+    "\U0001F900-\U0001F9FF"  # Supplemental Symbols
+    "\U0001FA00-\U0001FA6F"  # Chess Symbols
+    "\U0001FA70-\U0001FAFF"  # Symbols Extended-A
+    "\U00002600-\U000026FF"  # Misc symbols
+    "\U0000FE00-\U0000FE0F"  # Variation Selectors
+    "\U0000200D"             # Zero Width Joiner
+    "\U00002B50"             # Star
+    "\U000024C2"             # Ⓜ (단일 기호, 범위 금지)
+    "\U0000203C-\U00003299"  # 일부 기호·한자 호환 (한글 음절 U+AC00 미포함)
+    "]+", flags=re.UNICODE
+)
+
+
+def normalize_name(name: str) -> str:
+    """이름 정규화: 이모티콘 제거 + 연속 공백을 하나로 + 앞뒤 공백 제거"""
+    text = EMOJI_PATTERN.sub('', str(name))
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
 # ============================================================
 # AppleScript 명령어
 # ============================================================
@@ -96,7 +128,15 @@ tell application "System Events"
     
     -- 2. 친구 목록으로 이동 (Cmd+1)
     keystroke "1" using command down
-    delay 0.8
+    delay 0.5
+    
+    -- 3. 창 크기 재설정 (채팅방 열고 닫으면 크기가 변할 수 있음)
+    tell process "KakaoTalk"
+        try
+            set size of window 1 to {1400, 900}
+        end try
+    end tell
+    delay 0.3
 end tell
 '''
 
@@ -252,16 +292,15 @@ def search_friend(name: str):
 
 
 def verify_friend_by_ocr(name: str, window_id: int) -> bool:
-    """OCR로 친구 검증 - 이름이 완전히 일치하는 텍스트가 최소 1개 이상 있어야 찾은 것으로 인식"""
+    """OCR로 친구 검증 - 정규화된 이름이 일치하는 텍스트가 최소 1개 이상 있어야 찾은 것으로 인식"""
     texts = capture_and_read(window_id)
+    normalized = normalize_name(name)
     
-    # 이름이 완전히 일치하는 텍스트 카운트
     name_count = 0
     for t in texts:
-        if name.strip() == t.strip():  # 완전 일치 (앞뒤 공백 제거 후 비교)
+        if normalized == normalize_name(t):
             name_count += 1
     
-    # 최소 1번 이상 완전 일치해야 친구를 찾은 것으로 인식
     return name_count >= 1
 
 
@@ -893,8 +932,8 @@ def upload_file():
         if file.filename == '':
             return jsonify({'success': False, 'error': '파일이 선택되지 않았습니다'})
         
-        # 임시 파일로 저장
-        temp_path = os.path.join(SCRIPT_DIR, 'temp_upload.xlsx')
+        # 임시 파일로 저장 (항상 쓰기 가능한 OS 임시 폴더)
+        temp_path = UPLOAD_TEMP_XLSX
         file.save(temp_path)
         current_file_path = temp_path
         
@@ -1078,8 +1117,8 @@ def run_sending_logic():
             }))
             return
 
-        # 동명이인 체크 (앞뒤 공백 제거 후 비교)
-        normalized_names = target_df['이름'].str.strip()
+        # 동명이인 체크 (이모티콘 제거 + 공백 정규화 후 비교)
+        normalized_names = target_df['이름'].apply(normalize_name)
         duplicated_names = normalized_names[normalized_names.duplicated(keep=False)].unique().tolist()
         if duplicated_names:
             names_str = ', '.join(duplicated_names)
