@@ -26,8 +26,14 @@ import Vision
 # ============================================================
 # 설정
 # ============================================================
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 카카오톡 자동화 튜닝 (다른 맥에서 검색/채팅 진입 안정화)
+KAKAOTALK_WINDOW_WIDTH = 1400
+KAKAOTALK_WINDOW_HEIGHT = 900
+SEARCH_RESULT_DOWN_ARROW_COUNT = 2
+CHAT_DELAY_BEFORE_ENTER = 0.55
+CHAT_DELAY_AFTER_ENTER = 1.35
 # 업로드 파일은 스크립트 폴더가 아닌 시스템 임시 디렉터리에 저장 (폴더명 공백·복사본 경로 등으로 인한 ENOENT 방지)
 UPLOAD_TEMP_XLSX = os.path.join(tempfile.gettempdir(), f'kakao_sender_upload_{os.getpid()}.xlsx')
 
@@ -129,14 +135,6 @@ tell application "System Events"
     -- 2. 친구 목록으로 이동 (Cmd+1)
     keystroke "1" using command down
     delay 0.5
-    
-    -- 3. 창 크기 재설정 (채팅방 열고 닫으면 크기가 변할 수 있음)
-    tell process "KakaoTalk"
-        try
-            set size of window 1 to {1400, 900}
-        end try
-    end tell
-    delay 0.3
 end tell
 '''
 
@@ -233,7 +231,8 @@ def ensure_kakaotalk_ready() -> Optional[int]:
 def search_friend(name: str):
     """친구 검색 (메뉴 클릭 방식 붙여넣기 사용)"""
     pyperclip.copy(name)
-    script = '''
+    n_down = SEARCH_RESULT_DOWN_ARROW_COUNT
+    script = f'''
     -- 카카오톡 확실히 활성화
     tell application "KakaoTalk" to activate
     delay 0.3
@@ -281,11 +280,11 @@ def search_friend(name: str):
         end tell
         delay 1.0
         
-        -- 7. 아래 화살표 (검색 결과로 이동)
-        key code 125
-        delay 0.2
-        key code 125
-        delay 0.2
+        -- 7. 아래 화살표 (검색 결과 리스트로 포커스 이동, 횟수: SEARCH_RESULT_DOWN_ARROW_COUNT)
+        repeat with _k from 1 to {n_down}
+            key code 125
+            delay 0.2
+        end repeat
     end tell
     '''
     run_applescript(script)
@@ -307,13 +306,19 @@ def verify_friend_by_ocr(name: str, window_id: int) -> bool:
 def send_message_to_friend(message: str):
     """채팅방에서 메시지 전송 (메뉴 클릭 방식)"""
     pyperclip.copy(message)
-    script = '''
+    db = CHAT_DELAY_BEFORE_ENTER
+    da = CHAT_DELAY_AFTER_ENTER
+    script = f'''
     tell application "KakaoTalk" to activate
     delay 0.3
     tell application "System Events"
-        -- 1. 채팅방 열기 (Enter) - 이미 검색 결과에서 화살표로 선택된 상태
+        tell process "KakaoTalk"
+            set frontmost to true
+        end tell
+        delay {db}
+        -- 1. 채팅방 열기 (Enter) — 검색 결과 리스트에 포커스가 있어야 함
         key code 36
-        delay 1.0
+        delay {da}
         
         -- 2. 메시지 붙여넣기 (Menu Click - Robust)
         tell process "KakaoTalk"
@@ -638,6 +643,10 @@ HTML_TEMPLATE = '''
             font-size: 12px;
             border-top: 1px solid #eee;
         }
+        .footer .version-badge {
+            color: #7c3aed;
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -708,7 +717,7 @@ HTML_TEMPLATE = '''
             <div class="log-area" id="logArea"></div>
         </div>
         <div class="footer">
-            카카오톡 자동 전송기 v{{ version }} | 전송 중 마우스/키보드 조작 금지
+            카카오톡 자동 전송기 <span class="version-badge">V{{ version }}</span> | 전송 중 마우스/키보드 조작 금지
         </div>
     </div>
 
@@ -992,6 +1001,60 @@ def log(msg):
     log_queue.put(json.dumps({'type': 'log', 'message': msg}))
 
 
+def resize_kakaotalk_window() -> bool:
+    """면적이 가장 큰 카카오톡 창을 지정 크기로 조정 (window 1 고정보다 다창 환경에 안정적). 결과는 로그로 남김."""
+    w, h = KAKAOTALK_WINDOW_WIDTH, KAKAOTALK_WINDOW_HEIGHT
+    script = f'''
+tell application "System Events"
+    tell process "KakaoTalk"
+        set frontmost to true
+        set wc to count of windows
+        if wc is 0 then
+            return "fail:no_windows"
+        end if
+        set maxIdx to 1
+        set maxArea to 0
+        repeat with i from 1 to wc
+            try
+                set sz to size of window i
+                set ww to item 1 of sz
+                set hh to item 2 of sz
+                set ar to ww * hh
+                if ar > maxArea then
+                    set maxArea to ar
+                    set maxIdx to i
+                end if
+            end try
+        end repeat
+        try
+            set size of window maxIdx to {{{w}, {h}}}
+            return "ok:" & maxIdx
+        on error errMsg
+            return "fail:" & errMsg
+        end try
+    end tell
+end tell
+'''
+    code, out, err = run_applescript(script)
+    out = (out or "").strip()
+    err = (err or "").strip()
+    ok = out.startswith("ok:")
+    if ok:
+        idx = out.split(":", 1)[1] if ":" in out else "?"
+        log(f"   -> ✅ 카카오톡 창 크기 조정 ({w}×{h}), 대상 창 index {idx} (면적 최대 창)")
+    else:
+        detail = out or err or f"exit {code}"
+        log(f"   -> ⚠️ 카카오톡 창 크기 조정 실패 또는 OS 제한: {detail}")
+    return ok
+
+
+def reset_search_and_resize():
+    """Esc·친구목록 복귀 후 창 크기 재적용"""
+    run_applescript(SCRIPT_RESET_SEARCH)
+    time.sleep(0.2)
+    resize_kakaotalk_window()
+
+
 class StopRequestedException(Exception):
     """전송 중단 요청 예외"""
     pass
@@ -1034,6 +1097,11 @@ def send_message(name: str, message: str) -> bool:
             log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
             return False
 
+        if EMOJI_PATTERN.search(str(name)):
+            log("   -> ℹ️ 이름에 이모티콘/특수기호 포함 — 검색은 엑셀 원본 그대로 붙여넣기, OCR은 기호 제거 후 비교합니다.")
+
+        resize_kakaotalk_window()
+
         # 2. 친구 검색
         log(f"   -> 📋 '{name}' 검색 중...")
         check_stop_requested()
@@ -1074,7 +1142,7 @@ def send_message(name: str, message: str) -> bool:
         # 성공/실패 관계없이 다음 검색을 위해 검색창 초기화 (중단 요청이 아닌 경우에만)
         if not stop_requested:
             try:
-                run_applescript(SCRIPT_RESET_SEARCH)
+                reset_search_and_resize()
                 # 중단 요청이 없을 때만 대기
                 if not stop_requested:
                     time.sleep(random.uniform(0.2, 0.5))
@@ -1176,22 +1244,10 @@ def run_sending_logic():
             }))
             return
 
-        # 카카오톡 창 크기 조정 (긴 이름 OCR 인식용: 1400x900)
-        run_applescript('''
-        tell application "System Events"
-            tell process "KakaoTalk"
-                set frontmost to true
-                set size of window 1 to {1400, 900}
-            end tell
-        end tell
-        ''')
-        time.sleep(0.5)
-        
-        log("✅ 카카오톡 준비 완료!")
-        
-        # 친구 목록으로 이동
-        run_applescript(SCRIPT_RESET_SEARCH)
+        # 친구 목록 복귀 + 창 크기 (면적 최대 창 기준)
+        reset_search_and_resize()
         time.sleep(1)
+        log("✅ 카카오톡 준비 완료!")
         
         success_count = 0
         failed_names = []
