@@ -26,9 +26,11 @@ import Vision
 # ============================================================
 # 설정
 # ============================================================
-VERSION = "1.0.2"
+VERSION = "1.0.9"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 카카오톡 자동화 튜닝 (다른 맥에서 검색/채팅 진입 안정화)
+KAKAOTALK_WINDOW_X = 50
+KAKAOTALK_WINDOW_Y = 50
 KAKAOTALK_WINDOW_WIDTH = 1400
 KAKAOTALK_WINDOW_HEIGHT = 900
 SEARCH_RESULT_DOWN_ARROW_COUNT = 2
@@ -53,6 +55,9 @@ app = Flask(__name__)
 log_queue = Queue()
 is_running = False
 stop_requested = False
+pause_requested = False
+pause_event = threading.Event()
+pause_event.set()  # starts unpaused
 current_file_path = None
 current_register_types = None
 current_age_groups = None
@@ -101,10 +106,13 @@ EMOJI_PATTERN = re.compile(
 
 
 def normalize_name(name: str) -> str:
-    """이름 정규화: 이모티콘 제거 + 연속 공백을 하나로 + 앞뒤 공백 제거"""
-    text = EMOJI_PATTERN.sub('', str(name))
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+    """이름 정규화: 연속 공백을 하나로 + 앞뒤 공백 제거 (동명이인 비교용)"""
+    return re.sub(r'\s+', ' ', str(name)).strip()
+
+
+def name_contains_emoji_or_symbol(name: str) -> bool:
+    """이름에 이모티콘/감지용 특수기호가 포함되는지 (전송 차단 판별용)"""
+    return bool(EMOJI_PATTERN.search(str(name)))
 
 
 # ============================================================
@@ -159,6 +167,17 @@ def get_kakaotalk_window_id():
                 candidates.append(window_id)
                 
     return candidates[0] if candidates else None
+
+
+def wait_for_kakaotalk_window(timeout: float = 3.0, interval: float = 0.3) -> Optional[int]:
+    """UI 전환 중 잠깐 사라지는 카카오톡 창이 다시 잡힐 때까지 대기."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        window_id = get_kakaotalk_window_id()
+        if window_id:
+            return window_id
+        time.sleep(interval)
+    return get_kakaotalk_window_id()
 
 
 def capture_and_read(window_id: int) -> List[str]:
@@ -218,8 +237,8 @@ def ensure_kakaotalk_ready() -> Optional[int]:
         run_applescript(script)
         time.sleep(0.5)
         
-        # 창 확인
-        window_id = get_kakaotalk_window_id()
+        # 창 확인: 카카오톡 UI 전환 중 일시적으로 창 목록이 비는 경우가 있어 짧게 대기
+        window_id = wait_for_kakaotalk_window(timeout=2.0)
         if window_id:
             return window_id
         
@@ -291,7 +310,7 @@ def search_friend(name: str):
 
 
 def verify_friend_by_ocr(name: str, window_id: int) -> bool:
-    """OCR로 친구 검증 - 정규화된 이름이 일치하는 텍스트가 최소 1개 이상 있어야 찾은 것으로 인식"""
+    """OCR로 친구 검증 - 공백 정규화 후 이름이 일치하는 텍스트가 최소 1개 이상 있어야 찾은 것으로 인식"""
     texts = capture_and_read(window_id)
     normalized = normalize_name(name)
     
@@ -304,11 +323,13 @@ def verify_friend_by_ocr(name: str, window_id: int) -> bool:
 
 
 def send_message_to_friend(message: str):
-    """채팅방에서 메시지 전송 (메뉴 클릭 방식)"""
+    """채팅방에서 메시지 전송 (메뉴 클릭 방식). 채팅방 열린 직후 창 크기 재고정."""
     pyperclip.copy(message)
     db = CHAT_DELAY_BEFORE_ENTER
     da = CHAT_DELAY_AFTER_ENTER
-    script = f'''
+
+    # 채팅방 열기
+    open_script = f'''
     tell application "KakaoTalk" to activate
     delay 0.3
     tell application "System Events"
@@ -316,11 +337,19 @@ def send_message_to_friend(message: str):
             set frontmost to true
         end tell
         delay {db}
-        -- 1. 채팅방 열기 (Enter) — 검색 결과 리스트에 포커스가 있어야 함
         key code 36
         delay {da}
-        
-        -- 2. 메시지 붙여넣기 (Menu Click - Robust)
+    end tell
+    '''
+    run_applescript(open_script)
+
+    # 채팅방 열린 직후 카카오톡 레이아웃 전환이 완전히 끝날 때까지 대기 후 리사이즈
+    time.sleep(0.8)
+    resize_kakaotalk_window(silent=True)
+
+    # 메시지 붙여넣기 → 전송 → 채팅방 닫기
+    send_script = '''
+    tell application "System Events"
         tell process "KakaoTalk"
             set frontmost to true
             try
@@ -336,21 +365,15 @@ def send_message_to_friend(message: str):
             end try
         end tell
         delay 0.5
-        
-        -- 3. 전송 (Enter)
         key code 36
         delay 0.5
-        
-        -- 4. 채팅방 닫기 (Esc)
         key code 53
         delay 0.5
-        
-        -- 5. (안전장치) 검색창 닫기 (Esc) - 혹시 검색창이 남아있다면
         key code 53
         delay 0.3
     end tell
     '''
-    run_applescript(script)
+    run_applescript(send_script)
 
 # ============================================================
 # HTML 템플릿
@@ -584,12 +607,34 @@ HTML_TEMPLATE = '''
             background: #e4606d;
             cursor: not-allowed;
         }
+        .log-wrapper {
+            position: relative;
+            margin-top: 25px;
+        }
+        .log-copy-btn {
+            position: absolute;
+            top: 10px;
+            right: 14px;
+            background: rgba(255,255,255,0.12);
+            border: 1px solid rgba(255,255,255,0.2);
+            color: #ccc;
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 12px;
+            cursor: pointer;
+            z-index: 2;
+            transition: background 0.2s;
+        }
+        .log-copy-btn:hover {
+            background: rgba(255,255,255,0.25);
+            color: #fff;
+        }
         .log-area {
             background: #1e1e1e;
             border-radius: 12px;
             padding: 20px;
-            margin-top: 25px;
-            max-height: 300px;
+            padding-top: 40px;
+            max-height: 900px;
             overflow-y: auto;
             font-family: 'Menlo', 'Monaco', monospace;
             font-size: 13px;
@@ -597,6 +642,19 @@ HTML_TEMPLATE = '''
         .log-area:empty::before {
             content: "로그가 여기에 표시됩니다...";
             color: #666;
+        }
+        .btn-pause {
+            background: linear-gradient(135deg, #f5a623, #f7c948);
+            color: #333;
+            font-weight: 700;
+        }
+        .btn-pause:hover {
+            background: linear-gradient(135deg, #e09500, #f5a623);
+        }
+        .btn-pause:disabled {
+            background: #c9a84e;
+            cursor: not-allowed;
+            opacity: 0.6;
         }
         .log-line {
             color: #d4d4d4;
@@ -710,11 +768,17 @@ HTML_TEMPLATE = '''
             <button class="btn btn-start" id="startBtn" disabled onclick="startSending()">
                 🚀 카카오톡 전송 시작
             </button>
+            <button class="btn btn-pause" id="pauseBtn" style="display:none;" onclick="togglePause()">
+                ⏸ 일시정지
+            </button>
             <button class="btn btn-stop" id="stopBtn" style="display:none;" onclick="stopSending()">
                 ⏹ 전송 중단
             </button>
             
-            <div class="log-area" id="logArea"></div>
+            <div class="log-wrapper">
+                <button class="log-copy-btn" onclick="copyLog()" title="로그 복사">📋 복사</button>
+                <div class="log-area" id="logArea"></div>
+            </div>
         </div>
         <div class="footer">
             카카오톡 자동 전송기 <span class="version-badge">V{{ version }}</span> | 전송 중 마우스/키보드 조작 금지
@@ -724,6 +788,7 @@ HTML_TEMPLATE = '''
     <script>
         let selectedFile = null;
         let eventSource = null;
+        let isPaused = false;
         
         function toggleFilter(btn) {
             btn.classList.toggle('active');
@@ -821,6 +886,10 @@ HTML_TEMPLATE = '''
             formData.append('file', selectedFile);
             
             document.getElementById('startBtn').style.display = 'none';
+            document.getElementById('pauseBtn').style.display = 'block';
+            document.getElementById('pauseBtn').disabled = false;
+            document.getElementById('pauseBtn').textContent = '⏸ 일시정지';
+            isPaused = false;
             document.getElementById('stopBtn').style.display = 'block';
             document.getElementById('stopBtn').disabled = false;
             document.getElementById('stopBtn').textContent = '⏹ 전송 중단';
@@ -860,7 +929,36 @@ HTML_TEMPLATE = '''
         function stopSending() {
             document.getElementById('stopBtn').disabled = true;
             document.getElementById('stopBtn').textContent = '⏹ 중단 중...';
+            document.getElementById('pauseBtn').style.display = 'none';
             fetch('/stop', { method: 'POST' });
+        }
+        
+        function togglePause() {
+            if (!isPaused) {
+                isPaused = true;
+                document.getElementById('pauseBtn').textContent = '⏸ 현재 작업 완료 후 일시정지...';
+                document.getElementById('pauseBtn').disabled = true;
+                document.getElementById('statusBadge').textContent = '일시정지 대기...';
+                fetch('/pause', { method: 'POST' });
+            } else {
+                isPaused = false;
+                document.getElementById('pauseBtn').textContent = '⏸ 일시정지';
+                document.getElementById('statusBadge').className = 'status-badge status-running';
+                document.getElementById('statusBadge').textContent = '전송 중...';
+                fetch('/resume', { method: 'POST' });
+            }
+        }
+        
+        function copyLog() {
+            const logArea = document.getElementById('logArea');
+            const lines = logArea.querySelectorAll('.log-line');
+            const text = Array.from(lines).map(l => l.textContent).join('\\n');
+            navigator.clipboard.writeText(text).then(() => {
+                const btn = document.querySelector('.log-copy-btn');
+                const orig = btn.textContent;
+                btn.textContent = '✅ 복사됨';
+                setTimeout(() => { btn.textContent = orig; }, 1500);
+            });
         }
         
         function startLogStream() {
@@ -878,8 +976,15 @@ HTML_TEMPLATE = '''
                     else if (data.message.includes('❌') || data.message.includes('실패')) logType = 'error';
                     else if (data.message.includes('⚠️') || data.message.includes('중단')) logType = 'warning';
                     else if (data.message.includes('🚀') || data.message.includes('📋')) logType = 'info';
+                    else if (data.message.includes('⏸')) logType = 'warning';
+                    else if (data.message.includes('▶️')) logType = 'info';
                     
                     addLog(data.message, logType);
+                } else if (data.type === 'paused') {
+                    document.getElementById('pauseBtn').textContent = '▶️ 재개';
+                    document.getElementById('pauseBtn').disabled = false;
+                    document.getElementById('statusBadge').className = 'status-badge status-idle';
+                    document.getElementById('statusBadge').textContent = '일시정지';
                 } else if (data.type === 'complete') {
                     eventSource.close();
                     resetUI();
@@ -903,9 +1008,11 @@ HTML_TEMPLATE = '''
         function resetUI() {
             document.getElementById('startBtn').style.display = 'block';
             document.getElementById('startBtn').disabled = false;
+            document.getElementById('pauseBtn').style.display = 'none';
             document.getElementById('stopBtn').style.display = 'none';
             document.getElementById('statusBadge').className = 'status-badge status-idle';
             document.getElementById('statusBadge').textContent = '대기 중';
+            isPaused = false;
         }
     </script>
 </body>
@@ -966,6 +1073,8 @@ def start_sending():
     
     is_running = True
     stop_requested = False
+    pause_requested = False
+    pause_event.set()
     thread = threading.Thread(target=run_sending_logic, daemon=True)
     thread.start()
     
@@ -976,6 +1085,22 @@ def start_sending():
 def stop_sending():
     global stop_requested
     stop_requested = True
+    pause_event.set()  # 일시정지 중이면 풀어서 중단이 즉시 동작하도록
+    return jsonify({'success': True})
+
+
+@app.route('/pause', methods=['POST'])
+def pause_sending():
+    global pause_requested
+    pause_requested = True
+    return jsonify({'success': True})
+
+
+@app.route('/resume', methods=['POST'])
+def resume_sending():
+    global pause_requested
+    pause_requested = False
+    pause_event.set()
     return jsonify({'success': True})
 
 
@@ -1001,10 +1126,16 @@ def log(msg):
     log_queue.put(json.dumps({'type': 'log', 'message': msg}))
 
 
-def resize_kakaotalk_window() -> bool:
-    """면적이 가장 큰 카카오톡 창을 지정 크기로 조정 (window 1 고정보다 다창 환경에 안정적). 결과는 로그로 남김."""
+def resize_kakaotalk_window(silent=False) -> bool:
+    """면적이 가장 큰 카카오톡 창의 위치+크기를 강제 고정.
+    설정 후 이중 검증(set → 대기 → 재확인 → 대기 → 최종확인)으로
+    카카오톡이 뒤늦게 크기를 되돌리는 레이스 컨디션을 방지한다."""
+    x, y = KAKAOTALK_WINDOW_X, KAKAOTALK_WINDOW_Y
     w, h = KAKAOTALK_WINDOW_WIDTH, KAKAOTALK_WINDOW_HEIGHT
-    script = f'''
+    tolerance = 30
+    max_attempts = 4
+
+    set_script = f'''
 tell application "System Events"
     tell process "KakaoTalk"
         set frontmost to true
@@ -1027,6 +1158,7 @@ tell application "System Events"
             end try
         end repeat
         try
+            set position of window maxIdx to {{{x}, {y}}}
             set size of window maxIdx to {{{w}, {h}}}
             return "ok:" & maxIdx
         on error errMsg
@@ -1035,24 +1167,106 @@ tell application "System Events"
     end tell
 end tell
 '''
-    code, out, err = run_applescript(script)
-    out = (out or "").strip()
-    err = (err or "").strip()
-    ok = out.startswith("ok:")
-    if ok:
-        idx = out.split(":", 1)[1] if ":" in out else "?"
-        log(f"   -> ✅ 카카오톡 창 크기 조정 ({w}×{h}), 대상 창 index {idx} (면적 최대 창)")
-    else:
-        detail = out or err or f"exit {code}"
-        log(f"   -> ⚠️ 카카오톡 창 크기 조정 실패 또는 OS 제한: {detail}")
-    return ok
+
+    verify_script = f'''
+tell application "System Events"
+    tell process "KakaoTalk"
+        set wc to count of windows
+        if wc is 0 then
+            return "fail:no_windows"
+        end if
+        set maxIdx to 1
+        set maxArea to 0
+        repeat with i from 1 to wc
+            try
+                set sz to size of window i
+                set ww to item 1 of sz
+                set hh to item 2 of sz
+                set ar to ww * hh
+                if ar > maxArea then
+                    set maxArea to ar
+                    set maxIdx to i
+                end if
+            end try
+        end repeat
+        set actualPos to position of window maxIdx
+        set actualSize to size of window maxIdx
+        set ax to item 1 of actualPos
+        set ay to item 2 of actualPos
+        set aw to item 1 of actualSize
+        set ah to item 2 of actualSize
+        return "check:" & maxIdx & ":" & ax & ":" & ay & ":" & aw & ":" & ah
+    end tell
+end tell
+'''
+
+    def _verify_size() -> tuple:
+        """현재 창 크기를 확인하여 (성공여부, idx, aw, ah) 반환"""
+        code2, out2, _ = run_applescript(verify_script)
+        out2 = (out2 or "").strip()
+        if out2.startswith("check:"):
+            parts = out2.split(":")
+            return True, parts[1], int(parts[4]), int(parts[5])
+        return False, "?", 0, 0
+
+    for attempt in range(max_attempts):
+        code, out, err = run_applescript(set_script)
+        out = (out or "").strip()
+        err = (err or "").strip()
+
+        if out.startswith("fail:"):
+            detail = out.split(":", 1)[1] if ":" in out else (err or f"exit {code}")
+            if detail == "no_windows" and attempt < max_attempts - 1:
+                run_applescript('tell application "KakaoTalk" to activate')
+                wait_for_kakaotalk_window(timeout=1.5)
+                time.sleep(0.3)
+                continue
+            if not silent:
+                log(f"   -> ⚠️ 카카오톡 창 크기 조정 실패: {detail}")
+            return False
+
+        if out.startswith("ok:"):
+            time.sleep(0.5)
+            ok, idx, aw, ah = _verify_size()
+            if ok and abs(aw - w) <= tolerance and abs(ah - h) <= tolerance:
+                time.sleep(0.5)
+                ok2, idx2, aw2, ah2 = _verify_size()
+                if ok2 and abs(aw2 - w) <= tolerance and abs(ah2 - h) <= tolerance:
+                    if not silent:
+                        log(f"   -> ✅ 카카오톡 창 고정 ({x},{y} → {w}×{h}), 대상 창 index {idx2}")
+                    return True
+                else:
+                    if attempt < max_attempts - 1:
+                        wait_for_kakaotalk_window(timeout=1.0)
+                        time.sleep(0.3)
+                        continue
+            else:
+                if attempt < max_attempts - 1:
+                    wait_for_kakaotalk_window(timeout=1.0)
+                    time.sleep(0.5)
+                    continue
+
+            if not silent:
+                log(f"   -> ⚠️ 카카오톡 창 크기 불일치 (실제: {aw}×{ah}, 목표: {w}×{h}) — {max_attempts}회 재시도 후 포기")
+            return False
+
+        if not silent:
+            detail = out or err or f"exit {code}"
+            log(f"   -> ⚠️ 카카오톡 창 크기 조정 실패 또는 OS 제한: {detail}")
+        return False
+    return False
 
 
-def reset_search_and_resize():
-    """Esc·친구목록 복귀 후 창 크기 재적용"""
+def reset_search_and_resize(silent=False) -> bool:
+    """Esc·친구목록 복귀 후 창 크기 재적용 (레이아웃 전환 완료 대기 후 리사이즈)"""
     run_applescript(SCRIPT_RESET_SEARCH)
-    time.sleep(0.2)
-    resize_kakaotalk_window()
+    window_id = wait_for_kakaotalk_window(timeout=3.0)
+    if not window_id:
+        if not silent:
+            log("   -> ⚠️ 다음 검색 준비 중 카카오톡 창 복구 대기 실패")
+        return False
+    time.sleep(0.5)
+    return resize_kakaotalk_window(silent=silent)
 
 
 class StopRequestedException(Exception):
@@ -1094,11 +1308,13 @@ def send_message(name: str, message: str) -> bool:
         window_id = ensure_kakaotalk_ready()
         check_stop_requested()
         if not window_id:
-            log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
-            return False
-
-        if EMOJI_PATTERN.search(str(name)):
-            log("   -> ℹ️ 이름에 이모티콘/특수기호 포함 — 검색은 엑셀 원본 그대로 붙여넣기, OCR은 기호 제거 후 비교합니다.")
+            log(f"   -> ⚠️ 카카오톡 창을 찾지 못해 복구를 시도합니다.")
+            reset_search_and_resize(silent=True)
+            window_id = ensure_kakaotalk_ready()
+            check_stop_requested()
+            if not window_id:
+                log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
+                return False
 
         resize_kakaotalk_window()
 
@@ -1107,14 +1323,21 @@ def send_message(name: str, message: str) -> bool:
         check_stop_requested()
         search_friend(name)
         safe_sleep((1.0, 2.0))  # 검색 결과 로딩 대기 (랜덤, 중단 체크 포함)
+        # 검색 UI 전환으로 창이 줄어든 뒤 OCR 전에 다시 고정
+        resize_kakaotalk_window(silent=True)
         
         # 3. OCR 검증
         check_stop_requested()
         window_id = ensure_kakaotalk_ready()
         check_stop_requested()
         if not window_id:
-            log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
-            return False
+            log(f"   -> ⚠️ OCR 전 카카오톡 창을 찾지 못해 복구를 시도합니다.")
+            reset_search_and_resize(silent=True)
+            window_id = ensure_kakaotalk_ready()
+            check_stop_requested()
+            if not window_id:
+                log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
+                return False
         
         log(f"   -> 🔍 OCR 검증 중...")
         check_stop_requested()
@@ -1142,7 +1365,7 @@ def send_message(name: str, message: str) -> bool:
         # 성공/실패 관계없이 다음 검색을 위해 검색창 초기화 (중단 요청이 아닌 경우에만)
         if not stop_requested:
             try:
-                reset_search_and_resize()
+                reset_search_and_resize(silent=True)
                 # 중단 요청이 없을 때만 대기
                 if not stop_requested:
                     time.sleep(random.uniform(0.2, 0.5))
@@ -1152,7 +1375,7 @@ def send_message(name: str, message: str) -> bool:
 
 def run_sending_logic():
     """메인 전송 로직"""
-    global is_running, stop_requested
+    global is_running, stop_requested, pause_requested
     import json
     
     try:
@@ -1173,6 +1396,9 @@ def run_sending_logic():
         
         count = len(target_df)
         log(f"✅ 타겟 멤버 {count}명 필터링됨")
+        if count > 0:
+            filtered_names = [str(x) for x in target_df['이름'].tolist()]
+            log(f"   📋 필터링된 멤버: {', '.join(filtered_names)}")
         
         if count == 0:
             log("⚠️ 타겟 멤버가 없습니다.")
@@ -1185,7 +1411,7 @@ def run_sending_logic():
             }))
             return
 
-        # 동명이인 체크 (이모티콘 제거 + 공백 정규화 후 비교)
+        # 동명이인 체크 (공백 정규화 후 비교)
         normalized_names = target_df['이름'].apply(normalize_name)
         duplicated_names = normalized_names[normalized_names.duplicated(keep=False)].unique().tolist()
         if duplicated_names:
@@ -1193,6 +1419,23 @@ def run_sending_logic():
             log(f"❌ 동명이인 오류: 전송 대상에 같은 이름이 존재합니다 → {names_str}")
             log("🚫 동명이인이 있을 경우 카카오톡 검색 오류가 발생할 수 있어 전송을 중단합니다.")
             log("📋 엑셀 파일에서 해당 이름의 중복 여부를 확인한 후 다시 시도해주세요.")
+            log_queue.put(json.dumps({
+                'type': 'complete',
+                'success': 0,
+                'total': count,
+                'failed_names': [],
+                'stopped': True
+            }))
+            return
+
+        # 이모티콘/감지 기호 포함 이름 차단 (OCR·환경 이슈 방지)
+        emoji_rows = target_df['이름'].apply(name_contains_emoji_or_symbol)
+        if emoji_rows.any():
+            bad_names = target_df.loc[emoji_rows, '이름'].unique().tolist()
+            names_str = ', '.join(str(x) for x in bad_names)
+            log(f"❌ 이모티콘 오류: 이름에 이모티콘 또는 지원하지 않는 기호가 포함된 행이 있습니다 → {names_str}")
+            log("🚫 이모티콘이 포함된 이름은 자동 전송에서 지원하지 않아 실행을 중단합니다.")
+            log("📋 엑셀에서 이모티콘을 제거하거나, 카카오톡 표시 이름과 맞게 텍스트만 남긴 후 다시 시도해주세요.")
             log_queue.put(json.dumps({
                 'type': 'complete',
                 'success': 0,
@@ -1254,6 +1497,18 @@ def run_sending_logic():
         stopped = False
         
         for i, (_, row) in enumerate(target_df.iterrows()):
+            # 일시정지 체크 (현재 대상자 시작 전에 확인)
+            if pause_requested:
+                log(f"⏸ 일시정지됨 — 재개 버튼을 누르면 [{i + 1}/{count}]번째부터 이어서 전송합니다.")
+                log_queue.put(json.dumps({'type': 'paused'}))
+                pause_event.clear()
+                pause_event.wait()
+                if stop_requested:
+                    log(f"\n⚠️ 사용자에 의해 전송이 중단되었습니다. ({i}/{count} 처리됨)")
+                    stopped = True
+                    break
+                log(f"▶️ 전송 재개!")
+
             # 중단 요청 확인
             check_stop_requested()
             
@@ -1314,6 +1569,8 @@ def run_sending_logic():
     finally:
         is_running = False
         stop_requested = False
+        pause_requested = False
+        pause_event.set()
 
 
 # ============================================================
