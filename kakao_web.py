@@ -26,7 +26,7 @@ import Vision
 # ============================================================
 # 설정
 # ============================================================
-VERSION = "1.0.9"
+VERSION = "1.0.10"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 카카오톡 자동화 튜닝 (다른 맥에서 검색/채팅 진입 안정화)
 KAKAOTALK_WINDOW_X = 50
@@ -34,6 +34,7 @@ KAKAOTALK_WINDOW_Y = 50
 KAKAOTALK_WINDOW_WIDTH = 1400
 KAKAOTALK_WINDOW_HEIGHT = 900
 SEARCH_RESULT_DOWN_ARROW_COUNT = 2
+DECORATED_NAME_MIN_CHARS = 3
 CHAT_DELAY_BEFORE_ENTER = 0.55
 CHAT_DELAY_AFTER_ENTER = 1.35
 # 업로드 파일은 스크립트 폴더가 아닌 시스템 임시 디렉터리에 저장 (폴더명 공백·복사본 경로 등으로 인한 ENOENT 방지)
@@ -108,6 +109,17 @@ EMOJI_PATTERN = re.compile(
 def normalize_name(name: str) -> str:
     """이름 정규화: 연속 공백을 하나로 + 앞뒤 공백 제거 (동명이인 비교용)"""
     return re.sub(r'\s+', ' ', str(name)).strip()
+
+
+def normalize_name_for_ocr_match(name: str) -> str:
+    """OCR 비교용 이름 정규화: 이모티콘/장식 기호 제거 + 공백 정리."""
+    text = EMOJI_PATTERN.sub('', str(name))
+    return normalize_name(text)
+
+
+def comparable_name_length(name: str) -> int:
+    """공백을 제외한 비교용 이름 길이."""
+    return len(re.sub(r'\s+', '', name))
 
 
 def name_contains_emoji_or_symbol(name: str) -> bool:
@@ -310,16 +322,51 @@ def search_friend(name: str):
 
 
 def verify_friend_by_ocr(name: str, window_id: int) -> bool:
-    """OCR로 친구 검증 - 공백 정규화 후 이름이 일치하는 텍스트가 최소 1개 이상 있어야 찾은 것으로 인식"""
+    """OCR로 친구 검증.
+
+    1) 정확 일치 우선
+    2) 실패 시 이모티콘/장식 기호 제거 후 엄격 비교
+    3) 짧은 이름 또는 중복 후보는 오발송 방지를 위해 실패 처리
+    """
     texts = capture_and_read(window_id)
     normalized = normalize_name(name)
-    
-    name_count = 0
+    exact_matches = set()
     for t in texts:
         if normalized == normalize_name(t):
-            name_count += 1
-    
-    return name_count >= 1
+            exact_matches.add(normalize_name(t))
+
+    if exact_matches:
+        return True
+
+    decorated_normalized = normalize_name_for_ocr_match(name)
+    if comparable_name_length(decorated_normalized) < DECORATED_NAME_MIN_CHARS:
+        log(f"   -> ⚠️ '{name}'은 이름이 짧아 장식기호 제거 OCR 비교를 건너뜁니다.")
+        return False
+
+    decorated_matches = {}
+    for t in texts:
+        candidate = normalize_name_for_ocr_match(t)
+        if candidate == decorated_normalized:
+            decorated_matches[normalize_name(t)] = candidate
+
+    if len(decorated_matches) == 1:
+        raw_match = next(iter(decorated_matches.keys()))
+        log(f"   -> ✅ 장식기호 제거 후 OCR 확인됨: '{raw_match}' → '{decorated_normalized}'")
+        return True
+
+    if len(decorated_matches) > 1:
+        candidates = ', '.join(decorated_matches.keys())
+        log(f"   -> ⚠️ 장식기호 제거 후 같은 이름 후보가 여러 개입니다: {candidates}")
+        return False
+
+    visible_texts = [normalize_name(t) for t in texts if normalize_name(t)]
+    if visible_texts:
+        preview = ', '.join(visible_texts[:5])
+        suffix = ' ...' if len(visible_texts) > 5 else ''
+        log(f"   -> ℹ️ OCR 후보: {preview}{suffix}")
+    else:
+        log("   -> ℹ️ OCR 후보를 읽지 못했습니다.")
+    return False
 
 
 def send_message_to_friend(message: str):
