@@ -26,7 +26,7 @@ import Vision
 # ============================================================
 # 설정
 # ============================================================
-VERSION = "1.0.10"
+VERSION = "1.0.11"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 카카오톡 자동화 튜닝 (다른 맥에서 검색/채팅 진입 안정화)
 KAKAOTALK_WINDOW_X = 50
@@ -35,6 +35,11 @@ KAKAOTALK_WINDOW_WIDTH = 1400
 KAKAOTALK_WINDOW_HEIGHT = 900
 SEARCH_RESULT_DOWN_ARROW_COUNT = 2
 DECORATED_NAME_MIN_CHARS = 3
+SUBSTRING_MATCH_MIN_CHARS = 4
+MAX_SEARCH_OCR_ATTEMPTS = 2
+SEARCH_INPUT_VERIFY_ATTEMPTS = 2
+OCR_DEBUG_SAVE = True
+OCR_DEBUG_DIR = os.path.join(tempfile.gettempdir(), 'kakao_sender_ocr_debug')
 CHAT_DELAY_BEFORE_ENTER = 0.55
 CHAT_DELAY_AFTER_ENTER = 1.35
 # 업로드 파일은 스크립트 폴더가 아닌 시스템 임시 디렉터리에 저장 (폴더명 공백·복사본 경로 등으로 인한 ENOENT 방지)
@@ -224,6 +229,27 @@ def capture_and_read(window_id: int) -> List[str]:
     return results_text
 
 
+def save_window_screenshot(window_id: int, label: str) -> Optional[str]:
+    """디버그용으로 카카오톡 창 캡처를 PNG로 저장. 실패하면 None 반환."""
+    if not OCR_DEBUG_SAVE:
+        return None
+    try:
+        os.makedirs(OCR_DEBUG_DIR, exist_ok=True)
+        safe_label = re.sub(r'[^\w가-힣\-]+', '_', str(label), flags=re.UNICODE)[:40] or 'ocr'
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        out_path = os.path.join(OCR_DEBUG_DIR, f'{ts}_{safe_label}.png')
+        subprocess.run(
+            ['screencapture', '-l', str(window_id), '-x', out_path],
+            check=False, timeout=5,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return out_path
+    except Exception:
+        return None
+    return None
+
+
 def ensure_kakaotalk_ready() -> Optional[int]:
     """카카오톡이 활성화되어 있고 창이 열려있는지 확인, 필요시 재시도"""
     max_retries = 3
@@ -259,42 +285,15 @@ def ensure_kakaotalk_ready() -> Optional[int]:
     return None
 
 
-def search_friend(name: str):
-    """친구 검색 (메뉴 클릭 방식 붙여넣기 사용)"""
+def _paste_into_search(name: str, use_keystroke: bool) -> None:
+    """검색창 열고 검색어를 붙여넣기. use_keystroke=True면 Cmd+V, False면 메뉴 클릭 사용."""
     pyperclip.copy(name)
-    n_down = SEARCH_RESULT_DOWN_ARROW_COUNT
-    script = f'''
-    -- 카카오톡 확실히 활성화
-    tell application "KakaoTalk" to activate
-    delay 0.3
-    
-    tell application "System Events"
-        tell process "KakaoTalk"
-            set frontmost to true
-        end tell
-        delay 0.3
-        
-        -- 1. Esc로 혹시 남아있는 채팅창/검색창 닫기
-        key code 53
-        delay 0.3
-        
-        -- 2. 친구 목록으로 이동 (Cmd+1) - 채팅창이 아닌 친구 목록에서 검색 보장
-        keystroke "1" using command down
-        delay 0.5
-        
-        -- 3. 검색창 열기 (Cmd+F)
-        key code 3 using command down
-        delay 0.5
-        
-        -- 4. 기존 검색어 전체 선택 (Cmd+A)
-        key code 0 using command down
-        delay 0.2
-        
-        -- 5. 삭제 (Backspace)
-        key code 51
-        delay 0.3
-        
-        -- 6. 메뉴 클릭으로 붙여넣기 (Tell Process 필수!)
+    if use_keystroke:
+        paste_block = '''
+        keystroke "v" using command down
+        '''
+    else:
+        paste_block = '''
         tell process "KakaoTalk"
             set frontmost to true
             try
@@ -309,9 +308,72 @@ def search_friend(name: str):
                 end try
             end try
         end tell
-        delay 1.0
-        
-        -- 7. 아래 화살표 (검색 결과 리스트로 포커스 이동, 횟수: SEARCH_RESULT_DOWN_ARROW_COUNT)
+        '''
+    script = f'''
+    tell application "KakaoTalk" to activate
+    delay 0.3
+
+    tell application "System Events"
+        tell process "KakaoTalk"
+            set frontmost to true
+        end tell
+        delay 0.3
+
+        -- 채팅창/검색창 닫기
+        key code 53
+        delay 0.3
+
+        -- 친구 목록으로 이동 (Cmd+1)
+        keystroke "1" using command down
+        delay 0.5
+
+        -- 검색창 열기 (Cmd+F)
+        key code 3 using command down
+        delay 0.5
+
+        -- 기존 검색어 전체 선택 + 삭제
+        key code 0 using command down
+        delay 0.2
+        key code 51
+        delay 0.3
+
+        -- 붙여넣기 (메뉴 클릭 또는 Cmd+V)
+        {paste_block}
+        delay 0.9
+    end tell
+    '''
+    run_applescript(script)
+
+
+def _read_search_field_text() -> str:
+    """검색창에 들어 있는 텍스트를 클립보드 경유로 읽어옴 (Cmd+A → Cmd+C)."""
+    script = '''
+    tell application "System Events"
+        tell process "KakaoTalk"
+            set frontmost to true
+            key code 0 using command down
+            delay 0.15
+            key code 8 using command down
+            delay 0.25
+        end tell
+    end tell
+    '''
+    run_applescript(script)
+    time.sleep(0.2)
+    try:
+        return pyperclip.paste() or ""
+    except Exception:
+        return ""
+
+
+def _move_focus_to_search_results() -> None:
+    """검색창에서 아래 화살표로 결과 리스트로 포커스 이동."""
+    n_down = SEARCH_RESULT_DOWN_ARROW_COUNT
+    script = f'''
+    tell application "System Events"
+        tell process "KakaoTalk"
+            set frontmost to true
+        end tell
         repeat with _k from 1 to {n_down}
             key code 125
             delay 0.2
@@ -321,52 +383,141 @@ def search_friend(name: str):
     run_applescript(script)
 
 
+def search_friend(name: str) -> bool:
+    """친구 검색. 검색창에 검색어가 실제로 들어갔는지 검증하고, 실패 시 Cmd+V로 재시도.
+
+    Returns:
+        True  - 검색창 입력 검증까지 성공
+        False - 두 번 시도해도 검증 실패 (그래도 결과 리스트로 포커스는 이동시켜 둠)
+    """
+    expected = normalize_name(name)
+    verified = False
+    for attempt in range(SEARCH_INPUT_VERIFY_ATTEMPTS):
+        use_keystroke = attempt > 0  # 1회차는 메뉴 클릭, 재시도부터 Cmd+V
+        _paste_into_search(name, use_keystroke=use_keystroke)
+        time.sleep(0.3)
+        actual = normalize_name(_read_search_field_text())
+        if actual == expected:
+            verified = True
+            break
+        method = "Cmd+V" if use_keystroke else "메뉴 클릭"
+        log(f"   -> ⚠️ 검색창 입력 확인 실패 ({method} 시도, 실제: '{actual[:30]}'). 재시도합니다.")
+
+    _move_focus_to_search_results()
+    return verified
+
+
+def _looks_like_search_field(candidate: str, query_normalized: str, decorated_query: str) -> bool:
+    """OCR 후보가 카카오톡 검색창 텍스트인지 판별.
+
+    검색창 좌측 돋보기 아이콘이 OCR에서 `Q`, `O`, `0` 등 1~2글자로 잘못 읽혀
+    `<짧은 prefix> <검색어>` 형태로 잡힌다. 친구 영역 매칭에서 이를 제외해야
+    검색창 텍스트가 친구 일치로 오인되지 않는다.
+    """
+    if not candidate:
+        return False
+    parts = candidate.strip().split(None, 1)
+    if len(parts) != 2:
+        return False
+    prefix, rest = parts
+    if len(prefix) > 2:
+        return False
+    rest_plain = normalize_name(rest)
+    rest_decorated = normalize_name_for_ocr_match(rest)
+    return rest_plain == query_normalized or rest_decorated == decorated_query
+
+
 def verify_friend_by_ocr(name: str, window_id: int) -> bool:
     """OCR로 친구 검증.
 
+    0) 검색창 텍스트('Q <검색어>' 형태)는 매칭 대상에서 제외 (오발송 방지)
     1) 정확 일치 우선
     2) 실패 시 이모티콘/장식 기호 제거 후 엄격 비교
-    3) 짧은 이름 또는 중복 후보는 오발송 방지를 위해 실패 처리
+    3) 그래도 실패 시 긴 이름에 한해 조건부 부분 일치 (정확히 한 후보 줄에 포함될 때만)
+    4) 짧은 이름이나 중복 후보는 오발송 방지를 위해 실패 처리
+    5) 최종 실패 시 OCR 후보와 캡처 이미지를 디버그용으로 남김
     """
     texts = capture_and_read(window_id)
     normalized = normalize_name(name)
+    decorated_normalized = normalize_name_for_ocr_match(name)
+
+    # 0) 검색창 텍스트는 매칭 대상에서 제외 — 검색창은 입력한 검색어가 그대로 보이므로
+    #    필터링하지 않으면 '친구가 없는 경우'에도 검색창만 보고 잘못 매칭될 수 있음.
+    friend_texts = [
+        t for t in texts
+        if not _looks_like_search_field(t, normalized, decorated_normalized)
+    ]
+
+    # 1) 정확 일치
     exact_matches = set()
-    for t in texts:
+    for t in friend_texts:
         if normalized == normalize_name(t):
             exact_matches.add(normalize_name(t))
 
     if exact_matches:
         return True
 
-    decorated_normalized = normalize_name_for_ocr_match(name)
-    if comparable_name_length(decorated_normalized) < DECORATED_NAME_MIN_CHARS:
+    # 2) 장식기호 제거 매칭
+    if comparable_name_length(decorated_normalized) >= DECORATED_NAME_MIN_CHARS:
+        decorated_matches = {}
+        for t in friend_texts:
+            candidate = normalize_name_for_ocr_match(t)
+            if candidate == decorated_normalized:
+                decorated_matches[normalize_name(t)] = candidate
+
+        if len(decorated_matches) == 1:
+            raw_match = next(iter(decorated_matches.keys()))
+            log(f"   -> ✅ 장식기호 제거 후 OCR 확인됨: '{raw_match}' → '{decorated_normalized}'")
+            return True
+        if len(decorated_matches) > 1:
+            candidates = ', '.join(decorated_matches.keys())
+            log(f"   -> ⚠️ 장식기호 제거 후 같은 이름 후보가 여러 개입니다: {candidates}")
+            _log_ocr_failure_diagnostics(name, window_id, texts)
+            return False
+    else:
         log(f"   -> ⚠️ '{name}'은 이름이 짧아 장식기호 제거 OCR 비교를 건너뜁니다.")
-        return False
 
-    decorated_matches = {}
-    for t in texts:
-        candidate = normalize_name_for_ocr_match(t)
-        if candidate == decorated_normalized:
-            decorated_matches[normalize_name(t)] = candidate
+    # 3) 부분 일치 (긴 이름에 한해 단일 후보만 허용)
+    if comparable_name_length(decorated_normalized) >= SUBSTRING_MATCH_MIN_CHARS:
+        substring_matches = []
+        for t in friend_texts:
+            candidate = normalize_name_for_ocr_match(t)
+            if not candidate or candidate == decorated_normalized:
+                continue
+            if decorated_normalized in candidate:
+                substring_matches.append(normalize_name(t))
 
-    if len(decorated_matches) == 1:
-        raw_match = next(iter(decorated_matches.keys()))
-        log(f"   -> ✅ 장식기호 제거 후 OCR 확인됨: '{raw_match}' → '{decorated_normalized}'")
-        return True
+        if len(substring_matches) == 1:
+            log(
+                f"   -> ✅ 부분 일치 후 OCR 확인됨: '{substring_matches[0]}' ⊇ '{decorated_normalized}'"
+            )
+            return True
+        if len(substring_matches) > 1:
+            candidates = ', '.join(substring_matches[:5])
+            suffix = ' ...' if len(substring_matches) > 5 else ''
+            log(f"   -> ⚠️ 부분 일치 후보가 여러 개입니다: {candidates}{suffix}")
+            _log_ocr_failure_diagnostics(name, window_id, texts)
+            return False
 
-    if len(decorated_matches) > 1:
-        candidates = ', '.join(decorated_matches.keys())
-        log(f"   -> ⚠️ 장식기호 제거 후 같은 이름 후보가 여러 개입니다: {candidates}")
-        return False
+    _log_ocr_failure_diagnostics(name, window_id, texts)
+    return False
 
+
+def _log_ocr_failure_diagnostics(name: str, window_id: int, texts: List[str]) -> None:
+    """OCR 검증 실패 시 디버깅용 후보 로그와 캡처 저장."""
     visible_texts = [normalize_name(t) for t in texts if normalize_name(t)]
     if visible_texts:
-        preview = ', '.join(visible_texts[:5])
-        suffix = ' ...' if len(visible_texts) > 5 else ''
+        max_preview = 30
+        preview = ', '.join(visible_texts[:max_preview])
+        suffix = f' ... (총 {len(visible_texts)}개)' if len(visible_texts) > max_preview else ''
         log(f"   -> ℹ️ OCR 후보: {preview}{suffix}")
     else:
         log("   -> ℹ️ OCR 후보를 읽지 못했습니다.")
-    return False
+
+    if OCR_DEBUG_SAVE:
+        saved = save_window_screenshot(window_id, name)
+        if saved:
+            log(f"   -> 🖼 디버그 캡처 저장됨: {saved}")
 
 
 def send_message_to_friend(message: str):
@@ -1365,33 +1516,46 @@ def send_message(name: str, message: str) -> bool:
 
         resize_kakaotalk_window()
 
-        # 2. 친구 검색
-        log(f"   -> 📋 '{name}' 검색 중...")
-        check_stop_requested()
-        search_friend(name)
-        safe_sleep((1.0, 2.0))  # 검색 결과 로딩 대기 (랜덤, 중단 체크 포함)
-        # 검색 UI 전환으로 창이 줄어든 뒤 OCR 전에 다시 고정
-        resize_kakaotalk_window(silent=True)
-        
-        # 3. OCR 검증
-        check_stop_requested()
-        window_id = ensure_kakaotalk_ready()
-        check_stop_requested()
-        if not window_id:
-            log(f"   -> ⚠️ OCR 전 카카오톡 창을 찾지 못해 복구를 시도합니다.")
-            reset_search_and_resize(silent=True)
+        # 2~3. 친구 검색 + OCR 검증 (검색 화면이 안 떴거나 OCR 타이밍 문제일 수 있어 1회 재시도)
+        verified = False
+        for attempt in range(MAX_SEARCH_OCR_ATTEMPTS):
+            check_stop_requested()
+            suffix = f" (재시도 {attempt}/{MAX_SEARCH_OCR_ATTEMPTS - 1})" if attempt else ""
+            log(f"   -> 📋 '{name}' 검색 중...{suffix}")
+            search_ok = search_friend(name)
+            if not search_ok:
+                log("   -> ⚠️ 검색창 입력 검증에 실패했지만 OCR로 추가 확인을 시도합니다.")
+            safe_sleep((1.0, 2.0))  # 검색 결과 로딩 대기 (랜덤, 중단 체크 포함)
+            # 검색 UI 전환으로 창이 줄어든 뒤 OCR 전에 다시 고정
+            resize_kakaotalk_window(silent=True)
+
+            check_stop_requested()
             window_id = ensure_kakaotalk_ready()
             check_stop_requested()
             if not window_id:
-                log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
-                return False
-        
-        log(f"   -> 🔍 OCR 검증 중...")
-        check_stop_requested()
-        if not verify_friend_by_ocr(name, window_id):
+                log(f"   -> ⚠️ OCR 전 카카오톡 창을 찾지 못해 복구를 시도합니다.")
+                reset_search_and_resize(silent=True)
+                window_id = ensure_kakaotalk_ready()
+                check_stop_requested()
+                if not window_id:
+                    log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
+                    return False
+
+            log(f"   -> 🔍 OCR 검증 중...")
+            check_stop_requested()
+            if verify_friend_by_ocr(name, window_id):
+                verified = True
+                break
+
+            if attempt < MAX_SEARCH_OCR_ATTEMPTS - 1:
+                log("   -> ↻ 검색을 한 번 더 시도합니다.")
+                reset_search_and_resize(silent=True)
+                safe_sleep((0.5, 1.0))
+
+        if not verified:
             log(f"   -> ❌ '{name}' 친구를 찾을 수 없습니다. (OCR 검증 실패)")
             return False
-        
+
         log(f"   -> ✅ '{name}' 친구 확인됨!")
 
         # 4. 메시지 전송
