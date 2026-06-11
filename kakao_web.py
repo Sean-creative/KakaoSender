@@ -39,7 +39,7 @@ except Exception:
 # ============================================================
 # 설정
 # ============================================================
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 카카오톡 자동화 튜닝 (다른 맥에서 검색/채팅 진입 안정화)
 KAKAOTALK_WINDOW_X = 50
@@ -112,6 +112,7 @@ current_file_path = None
 current_register_types = None
 current_age_groups = None
 current_message_template = None
+current_dry_run = False  # 모의 전송(테스트) 모드: 실제 메시지 발송을 생략
 
 
 @app.errorhandler(Exception)
@@ -361,29 +362,29 @@ def _paste_into_search(name: str, use_keystroke: bool) -> None:
         tell process "KakaoTalk"
             set frontmost to true
         end tell
-        delay 0.3
+        delay 0.2
 
         -- 채팅창/검색창 닫기
         key code 53
-        delay 0.3
+        delay 0.2
 
         -- 친구 목록으로 이동 (Cmd+1)
         keystroke "1" using command down
-        delay 0.5
+        delay 0.3
 
         -- 검색창 열기 (Cmd+F)
         key code 3 using command down
-        delay 0.5
+        delay 0.4
 
         -- 기존 검색어 전체 선택 + 삭제
         key code 0 using command down
-        delay 0.2
+        delay 0.15
         key code 51
-        delay 0.3
+        delay 0.2
 
         -- 붙여넣기 (메뉴 클릭 또는 Cmd+V)
         {paste_block}
-        delay 0.9
+        delay 0.5
     end tell
     '''
     run_applescript(script)
@@ -605,9 +606,8 @@ def verify_friend_by_ax(name: str) -> bool:
         if not names:
             return False
 
-        # 1) 정확 일치
+        # 1) 정확 일치 (가장 흔한 경로 — 로그는 호출부의 '친구 확인됨 (AX)'로 통합)
         if normalized in names:
-            log(f"   -> ✅ AX 확인됨: '{normalized}'")
             return True
 
         # 2) 장식기호 제거 후 일치
@@ -781,6 +781,52 @@ def send_message_to_friend(message: str):
     end tell
     '''
     run_applescript(send_script)
+
+
+def open_chat_then_close(wait_seconds: float = 1.0):
+    """[모의 전송용] 선택된 검색 결과의 채팅방을 열고, 잠시 후 닫는다.
+
+    메시지 붙여넣기/전송은 하지 않는다. 채팅방 진입·복귀 흐름만 실전과 동일하게 검증한다.
+    """
+    db = CHAT_DELAY_BEFORE_ENTER
+    da = CHAT_DELAY_AFTER_ENTER
+
+    # 채팅방 열기 (Enter)
+    open_script = f'''
+    tell application "KakaoTalk" to activate
+    delay 0.3
+    tell application "System Events"
+        tell process "KakaoTalk"
+            set frontmost to true
+        end tell
+        delay {db}
+        key code 36
+        delay {da}
+    end tell
+    '''
+    run_applescript(open_script)
+
+    # 채팅방 열린 직후 레이아웃 전환 대기 후 리사이즈 (실전과 동일)
+    time.sleep(0.8)
+    resize_kakaotalk_window(silent=True)
+
+    # 채팅방을 연 상태로 잠시 유지 (중단 요청은 즉시 반영)
+    safe_sleep((wait_seconds, wait_seconds))
+
+    # 채팅방 닫기 (Esc 2회)
+    close_script = '''
+    tell application "System Events"
+        tell process "KakaoTalk"
+            set frontmost to true
+        end tell
+        delay 0.2
+        key code 53
+        delay 0.3
+        key code 53
+        delay 0.3
+    end tell
+    '''
+    run_applescript(close_script)
 
 # ============================================================
 # HTML 템플릿
@@ -980,6 +1026,34 @@ HTML_TEMPLATE = '''
             outline: none;
             border-color: #667eea;
         }
+        .dryrun-section {
+            background: #fff8e1;
+            border: 1px solid #ffe082;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 20px;
+        }
+        .dryrun-label {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            cursor: pointer;
+            color: #5d4037;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        .dryrun-label input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            margin-top: 2px;
+            flex-shrink: 0;
+            cursor: pointer;
+            accent-color: #f0a500;
+        }
+        .dryrun-label .dryrun-desc {
+            color: #8d6e63;
+            font-size: 12px;
+        }
         .btn {
             width: 100%;
             padding: 16px;
@@ -1169,6 +1243,16 @@ HTML_TEMPLATE = '''
                 </div>
                 <textarea class="message-textarea" id="messageText">{{ default_message }}</textarea>
             </div>
+
+            <!-- 모의 전송(dry-run) 옵션 -->
+            <div class="dryrun-section">
+                <label class="dryrun-label">
+                    <input type="checkbox" id="dryRunCheck">
+                    <span>🧪 모의 전송(테스트) 모드<br>
+                        <span class="dryrun-desc">친구 검색·검증까지만 수행하고 <b>실제 메시지는 보내지 않습니다.</b> 대량 테스트용으로 안전합니다.</span>
+                    </span>
+                </label>
+            </div>
             
             <span class="status-badge status-idle" id="statusBadge">대기 중</span>
             
@@ -1275,6 +1359,7 @@ HTML_TEMPLATE = '''
             const registerTypes = getSelectedValues('registerTypeButtons');
             const ageGroups = getSelectedValues('ageGroupButtons');
             const messageText = document.getElementById('messageText').value;
+            const dryRun = document.getElementById('dryRunCheck').checked;
             
             if (registerTypes.length === 0) {
                 alert('등록형태를 최소 1개 이상 선택해주세요.');
@@ -1321,7 +1406,8 @@ HTML_TEMPLATE = '''
                         body: JSON.stringify({
                             register_types: registerTypes,
                             age_groups: ageGroups,
-                            message_template: messageText
+                            message_template: messageText,
+                            dry_run: dryRun
                         })
                     });
                 } else {
@@ -1470,7 +1556,7 @@ def upload_file():
 @app.route('/start', methods=['POST'])
 def start_sending():
     global is_running, stop_requested
-    global current_register_types, current_age_groups, current_message_template
+    global current_register_types, current_age_groups, current_message_template, current_dry_run
     
     if is_running:
         return jsonify({'success': False, 'error': '이미 실행 중입니다'})
@@ -1479,6 +1565,7 @@ def start_sending():
     current_register_types = data.get('register_types', DEFAULT_REGISTER_TYPES)
     current_age_groups = data.get('age_groups', DEFAULT_AGE_GROUPS)
     current_message_template = data.get('message_template', DEFAULT_MESSAGE_TEMPLATE)
+    current_dry_run = bool(data.get('dry_run', False))
     
     is_running = True
     stop_requested = False
@@ -1647,24 +1734,17 @@ end tell
             return False
 
         if out.startswith("ok:"):
-            time.sleep(0.5)
+            # AX 검증이 주력이 되면서 창 크기 영향이 줄어, 이중검증을 단일검증으로 축소.
+            time.sleep(0.3)
             ok, idx, aw, ah = _verify_size()
             if ok and abs(aw - w) <= tolerance and abs(ah - h) <= tolerance:
-                time.sleep(0.5)
-                ok2, idx2, aw2, ah2 = _verify_size()
-                if ok2 and abs(aw2 - w) <= tolerance and abs(ah2 - h) <= tolerance:
-                    if not silent:
-                        log(f"   -> ✅ 카카오톡 창 고정 ({x},{y} → {w}×{h}), 대상 창 index {idx2}")
-                    return True
-                else:
-                    if attempt < max_attempts - 1:
-                        wait_for_kakaotalk_window(timeout=1.0)
-                        time.sleep(0.3)
-                        continue
+                if not silent:
+                    log(f"   -> ✅ 카카오톡 창 고정 ({x},{y} → {w}×{h}), 대상 창 index {idx}")
+                return True
             else:
                 if attempt < max_attempts - 1:
                     wait_for_kakaotalk_window(timeout=1.0)
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     continue
 
             if not silent:
@@ -1720,8 +1800,11 @@ def safe_sleep(duration_range, show_log=False):
         check_stop_requested()
 
 
-def send_message(name: str, message: str) -> bool:
-    """카카오톡 메시지 전송 (OCR 검증 포함)"""
+def send_message(name: str, message: str, dry_run: bool = False) -> bool:
+    """카카오톡 메시지 전송 (AX·OCR 검증 포함).
+
+    dry_run=True이면 친구 검색·검증까지만 수행하고 실제 메시지는 보내지 않는다.
+    """
     try:
         check_stop_requested()
         
@@ -1737,21 +1820,30 @@ def send_message(name: str, message: str) -> bool:
                 log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
                 return False
 
-        resize_kakaotalk_window()
+        resize_kakaotalk_window(silent=True)
 
-        # 2~3. 친구 검색 + OCR 검증 (검색 화면이 안 떴거나 OCR 타이밍 문제일 수 있어 1회 재시도)
+        # 2~3. 친구 검색 + AX/OCR 검증 (검색 화면이 안 떴거나 타이밍 문제일 수 있어 1회 재시도)
         verified = False
+        verify_method = None
         for attempt in range(MAX_SEARCH_OCR_ATTEMPTS):
             check_stop_requested()
             suffix = f" (재시도 {attempt}/{MAX_SEARCH_OCR_ATTEMPTS - 1})" if attempt else ""
-            log(f"   -> 📋 '{name}' 검색 중...{suffix}")
+            log(f"   -> 📋 검색 중...{suffix}")
             search_ok = search_friend(name)
             if not search_ok:
-                log("   -> ⚠️ 검색창 입력 검증에 실패했지만 OCR로 추가 확인을 시도합니다.")
-            safe_sleep((1.0, 2.0))  # 검색 결과 로딩 대기 (랜덤, 중단 체크 포함)
-            # 검색 UI 전환으로 창이 줄어든 뒤 OCR 전에 다시 고정
-            resize_kakaotalk_window(silent=True)
+                log("   -> ⚠️ 검색창 입력 검증에 실패했지만 AX/OCR로 추가 확인을 시도합니다.")
+            safe_sleep((0.8, 1.2))  # 검색 결과 로딩 대기 (랜덤, 중단 체크 포함)
 
+            # 1순위: 접근성(AX) API로 검증 (창 크기와 무관하게 정확 → 창 고정·창확인 불필요)
+            check_stop_requested()
+            if verify_friend_by_ax(name):
+                verified = True
+                verify_method = "AX"
+                break
+
+            # 2순위: AX 미확인 시에만 OCR 폴백. OCR은 창 크기에 민감하므로
+            #        이 경로에서만 창 고정 + 창 확인을 수행한다 (성공 경로 속도 향상).
+            resize_kakaotalk_window(silent=True)
             check_stop_requested()
             window_id = ensure_kakaotalk_ready()
             check_stop_requested()
@@ -1764,17 +1856,11 @@ def send_message(name: str, message: str) -> bool:
                     log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
                     return False
 
-            # 1순위: 접근성(AX) API로 검증 (정확, 부수효과 없음)
-            check_stop_requested()
-            if verify_friend_by_ax(name):
-                verified = True
-                break
-
-            # 2순위: AX 미확인 시 기존 OCR로 폴백 (퇴보 없이 안전망 유지)
             log(f"   -> 🔍 OCR 검증 중...")
             check_stop_requested()
             if verify_friend_by_ocr(name, window_id):
                 verified = True
+                verify_method = "OCR"
                 break
 
             if attempt < MAX_SEARCH_OCR_ATTEMPTS - 1:
@@ -1786,11 +1872,14 @@ def send_message(name: str, message: str) -> bool:
             log(f"   -> ❌ '{name}' 친구를 찾을 수 없습니다. (AX·OCR 검증 실패)")
             return False
 
-        log(f"   -> ✅ '{name}' 친구 확인됨!")
+        log(f"   -> ✅ 친구 확인됨 ({verify_method})")
 
-        # 4. 메시지 전송
+        # 4. 메시지 전송 (모의 전송 모드면 채팅방만 열었다 닫고 발송은 생략)
         check_stop_requested()
-        log(f"   -> 📤 메시지 전송 중...")
+        if dry_run:
+            log(f"   -> 🧪 (모의 전송) 채팅방 열고 1초 후 닫음 — 실제 메시지는 보내지 않음")
+            open_chat_then_close(wait_seconds=1.0)
+            return True
         send_message_to_friend(message)
         safe_sleep((0.3, 0.8))  # 전송 후 대기 (랜덤, 중단 체크 포함)
         log(f"   -> ✅ 전송 완료!")
@@ -1820,6 +1909,8 @@ def run_sending_logic():
     import json
     
     try:
+        if current_dry_run:
+            log("🧪 모의 전송(테스트) 모드 — 친구 검증까지만 수행하며 실제 메시지는 전송되지 않습니다.")
         df = pd.read_excel(current_file_path)
         log(f"📊 전체 {len(df)}명 로드됨")
         
@@ -1959,7 +2050,7 @@ def run_sending_logic():
             log(f"[{i + 1}/{count}] {name}님 처리 중...")
             
             try:
-                if send_message(name, message):
+                if send_message(name, message, dry_run=current_dry_run):
                     success_count += 1
                 else:
                     failed_names.append(name)
