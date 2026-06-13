@@ -1,0 +1,37 @@
+---
+description: KakaoSender 프로젝트 개발 컨벤션 (버전 관리, AX/OCR 전략)
+alwaysApply: true
+---
+
+# KakaoSender 개발 컨벤션
+
+## 버전 관리
+
+- 버전은 `kakao_web.py` 상단의 `VERSION = "x.y.z"` 변수 하나로 관리한다.
+- 기능 추가·변경은 패치 버전(세 번째 자리)을 올린다. 예: `1.0.12` → `1.0.13`
+- 배포 시 반드시 아래를 세트로 처리한다:
+  1. `kakao_web.py`의 `VERSION` 변경
+  2. `KakaoSender_v{버전}/` 폴더 생성 후 파일 복사
+  3. `KakaoSender_v{버전}.zip` 생성
+  4. 이전 버전 폴더 및 zip 삭제
+- 코드 변경 전 반드시 문법 검사: `.venv/bin/python -m py_compile kakao_web.py`
+
+## AX 우선 / OCR 폴백 전략
+
+- 친구 검증은 **AX(접근성 API) 우선, OCR 폴백** 구조를 유지한다.
+- `verify_friend_by_ax()` → 실패 시 `verify_friend_by_ocr()` 순서를 깨지 않는다.
+- AX 검증 실패는 반드시 `False`를 반환해 OCR로 자연스럽게 넘어가야 하며, 예외로 크래시가 나선 안 된다. (최상위 `try/except` 필수)
+- 오발송 방지 가드: AX 검색창 값이 대상 이름과 일치할 때만 결과를 신뢰한다.
+- AX 이용 불가 환경을 위해 `AX_AVAILABLE` 플래그를 항상 확인한다.
+
+## 로그 원칙
+
+- 정상 경로(AX 성공)에서 친구 1명당 로그는 4줄 이내로 유지한다.
+  ```
+  [N/M] 이름님 처리 중...
+     -> 📋 검색 중...
+     -> ✅ 친구 확인됨 (AX)
+     -> ✅ 전송 완료!
+  ```
+- 경고·오류·폴백 상황의 진단 로그는 제거하지 않는다.
+- per-friend 창 리사이즈 로그는 `silent=True`로 처리한다.
