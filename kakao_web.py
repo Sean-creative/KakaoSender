@@ -7,6 +7,7 @@
 import os
 import sys
 import re
+import unicodedata
 import tempfile
 import subprocess
 import threading
@@ -36,6 +37,17 @@ try:
 except Exception:
     AX_AVAILABLE = False
 
+# 접근성(AX) '쓰기' 경로 — 검색어/메시지 입력과 전송을 키보드 없이 처리하기 위한 API.
+# 사용 불가 시 자동으로 기존 AppleScript(키 입력) 방식으로 폴백한다.
+try:
+    from ApplicationServices import (
+        AXUIElementSetAttributeValue,
+        AXUIElementIsAttributeSettable,
+    )
+    AX_WRITE_AVAILABLE = AX_AVAILABLE
+except Exception:
+    AX_WRITE_AVAILABLE = False
+
 # ============================================================
 # 설정
 # ============================================================
@@ -53,6 +65,9 @@ MAX_SEARCH_OCR_ATTEMPTS = 2
 SEARCH_INPUT_VERIFY_ATTEMPTS = 2
 # 친구 검증 시 접근성(AX) API를 우선 사용하고, 실패하면 기존 OCR로 폴백한다.
 USE_AX_VERIFICATION = True
+# 검색어/메시지 입력과 전송을 접근성(AX) API로 처리(키보드 비의존). 실패 시 키 입력으로 폴백.
+# AX 입력은 카카오톡이 최전면이 아니어도 동작해, 전송 중 다른 작업으로 포커스가 바뀌어도 안전하다.
+USE_AX_INPUT = True
 # 카카오톡 번들 식별자 (AX 앱 핸들 탐색용)
 KAKAO_BUNDLE_IDS = ('com.kakao.KakaoTalkMac', 'com.kakao.KakaoTalk')
 # 검색 결과에서 친구 이름이 담기는 AXStaticText 의 identifier
@@ -135,6 +150,24 @@ def run_applescript(script: str) -> tuple:
     return proc.returncode, out.decode('utf-8'), err.decode('utf-8')
 
 
+def _reliable_copy(text: str, retries: int = 3, verify_delay: float = 0.05) -> bool:
+    """클립보드에 text를 복사하고 즉시 검증한다.
+
+    macOS 보편적 클립보드(Handoff)가 켜져 있어도 복사 직후 값을 확인해
+    다른 기기가 덮어쓴 경우 재시도함으로써 오염 위험을 최소화한다.
+    반환값: 최종적으로 클립보드 내용이 text와 일치하면 True.
+    """
+    for attempt in range(retries):
+        pyperclip.copy(text)
+        time.sleep(verify_delay)
+        if pyperclip.paste() == text:
+            return True
+        if attempt < retries - 1:
+            log(f"   -> ⚠️ 클립보드 검증 실패 (재시도 {attempt + 1}/{retries - 1})...")
+    log("   -> ⚠️ 클립보드 내용 확인 불가 — Handoff 비활성화를 권장합니다.")
+    return False
+
+
 # 주의: U+24C2~U+1F251 같은 넓은 범위는 한글 음절(U+AC00~)까지 포함해 이름이 전부 지워짐
 EMOJI_PATTERN = re.compile(
     "["
@@ -175,6 +208,31 @@ def comparable_name_length(name: str) -> int:
 def name_contains_emoji_or_symbol(name: str) -> bool:
     """이름에 이모티콘/감지용 특수기호가 포함되는지 (전송 차단 판별용)"""
     return bool(EMOJI_PATTERN.search(str(name)))
+
+
+def canonicalize_name(name: str) -> str:
+    """정확 일치 비교용 정규화: NFC 정규화 + 변형 선택자 제거 + 공백 정리.
+
+    같은 글자의 다른 표기(예: ❤ vs ❤️, 한글 조합형/분해형)를 동일하게 보되,
+    서로 다른 사람을 합치지는 않는다 → 오발송 위험을 늘리지 않으면서
+    이모티콘 표현형 차이로 인한 '미발송'만 줄인다.
+    """
+    text = unicodedata.normalize('NFC', str(name))
+    text = re.sub(r'[\uFE00-\uFE0F]', '', text)  # 변형 선택자(presentation) 제거
+    return normalize_name(text)
+
+
+def name_for_search(name: str) -> str:
+    """카카오톡 검색창에 넣을 검색어.
+
+    이모티콘이 포함된 이름은 '텍스트만'으로 검색해 카카오톡 필터 신뢰성을 높인다.
+    (최종 친구 식별은 이모티콘까지 포함한 정확 일치로 별도 수행 → 오발송 방지)
+    """
+    if name_contains_emoji_or_symbol(name):
+        stripped = normalize_name_for_ocr_match(name)
+        if stripped:
+            return stripped
+    return name
 
 
 # ============================================================
@@ -331,8 +389,39 @@ def ensure_kakaotalk_ready() -> Optional[int]:
 
 
 def _paste_into_search(name: str, use_keystroke: bool) -> None:
-    """검색창 열고 검색어를 붙여넣기. use_keystroke=True면 Cmd+V, False면 메뉴 클릭 사용."""
-    pyperclip.copy(name)
+    """검색창 열고 검색어를 입력.
+
+    1순위(use_keystroke=False): 검색창을 열고 한 글자로 필드를 띄운 뒤 AX로 이름을 직접 써넣는다.
+                                 (키보드 비의존, 이모티콘 이름도 정확, 포커스 영향 없음)
+    2순위(use_keystroke=True 또는 AX 실패): 기존 방식(클립보드 + 메뉴 클릭/Cmd+V).
+    """
+    # AX 경로: 검색창 열기 → 필드 노출용 1글자 입력 → AX로 전체 값 덮어쓰기
+    if AX_WRITE_AVAILABLE and USE_AX_INPUT and not use_keystroke:
+        prime_script = '''
+        tell application "KakaoTalk" to activate
+        delay 0.3
+        tell application "System Events"
+            tell process "KakaoTalk"
+                set frontmost to true
+            end tell
+            delay 0.2
+            key code 53
+            delay 0.2
+            keystroke "1" using command down
+            delay 0.3
+            key code 3 using command down
+            delay 0.4
+            keystroke "."
+            delay 0.3
+        end tell
+        '''
+        run_applescript(prime_script)
+        time.sleep(0.2)
+        if _ax_write_search(name):
+            return
+        # AX 실패 → 아래 키 입력 폴백 (Cmd+A + delete로 프라임 문자 '.'까지 함께 정리됨)
+
+    _reliable_copy(name)
     if use_keystroke:
         paste_block = '''
         keystroke "v" using command down
@@ -564,6 +653,144 @@ def _ax_read_search_field(window, max_depth: int = 30) -> Optional[str]:
     return None
 
 
+# ============================================================
+# 접근성(AX) '쓰기' 헬퍼 — 키보드 없이 입력/전송
+#   - 검색어/메시지 입력을 AXValue 설정으로 처리(필터링도 작동 확인됨)
+#   - 전송은 입력 텍스트가 있을 때만 활성화되는 전송 버튼을 AXPress
+#   - 모든 함수는 실패 시 False/None 을 반환해 호출부에서 키 입력으로 폴백한다.
+# ============================================================
+def _ax_set(element, attr, value) -> bool:
+    """AX 속성에 값을 쓴다. 성공 시 True."""
+    if not AX_WRITE_AVAILABLE or element is None:
+        return False
+    try:
+        return AXUIElementSetAttributeValue(element, attr, value) == 0
+    except Exception:
+        return False
+
+
+def _ax_is_settable(element, attr) -> bool:
+    """AX 속성이 쓰기 가능한지 여부."""
+    if not AX_WRITE_AVAILABLE or element is None:
+        return False
+    try:
+        err, settable = AXUIElementIsAttributeSettable(element, attr, None)
+        return err == 0 and bool(settable)
+    except Exception:
+        return False
+
+
+def _ax_get_search_field_element(window, max_depth: int = 30):
+    """검색창(AXSearchField) 요소 자체를 반환. 없으면 None."""
+    for el in _ax_walk(window, max_depth):
+        if _ax_copy(el, "AXSubrole") == "AXSearchField":
+            return el
+    return None
+
+
+def _ax_get_message_input(window, max_depth: int = 35):
+    """채팅방 메시지 입력창(AXTextArea, 설명='메시지 입력')을 반환. 없으면 None.
+    채팅 말풍선도 AXTextArea라서 설명/placeholder로 입력창만 정확히 식별한다."""
+    for el in _ax_walk(window, max_depth):
+        if _ax_copy(el, "AXRole") != "AXTextArea":
+            continue
+        desc = _ax_copy(el, "AXDescription")
+        placeholder = _ax_copy(el, "AXPlaceholderValue")
+        if (desc and "메시지" in str(desc)) or (placeholder and "메시지" in str(placeholder)):
+            return el
+    return None
+
+
+def _ax_write_search(name: str) -> bool:
+    """AX로 검색창에 name을 직접 써넣는다(필터링도 이 값으로 작동).
+    검색창은 비어 있으면 AX 트리에 안 보이므로, 호출 전 최소 1글자가 입력돼 있어야 한다.
+    성공 시 True."""
+    if not (AX_WRITE_AVAILABLE and USE_AX_INPUT):
+        return False
+    try:
+        if not AXIsProcessTrusted():
+            return False
+        window = _ax_get_main_window(_ax_get_kakao_app_element())
+        if window is None:
+            return False
+        field = _ax_get_search_field_element(window)
+        if field is None or not _ax_is_settable(field, "AXValue"):
+            return False
+        if _ax_is_settable(field, "AXFocused"):
+            _ax_set(field, "AXFocused", True)
+            time.sleep(0.05)
+        if not _ax_set(field, "AXValue", name):
+            return False
+        time.sleep(0.1)
+        return _ax_read_search_field(window) == name
+    except Exception:
+        return False
+
+
+def _ax_input_and_send(message: str) -> bool:
+    """채팅방에서 AX로 메시지를 입력한 뒤 Enter로 전송한다. 성공 시 True.
+
+    입력은 AX(AXValue 설정)로 처리해 클립보드 오염(Handoff)·이모티콘 문제를 피하고,
+    전송만 Enter(key code 36)를 사용한다.
+    (전송 버튼 AXPress는 호출이 성공해도 실제 전송을 트리거하지 못해 사용하지 않는다.)
+
+    실패 시 입력창을 비우고 False 반환 → 호출부에서 클립보드 방식으로 폴백.
+    채팅방이 이미 열려 있어야 한다."""
+    if not (AX_WRITE_AVAILABLE and USE_AX_INPUT):
+        return False
+    msg_input = None
+    try:
+        if not AXIsProcessTrusted():
+            return False
+        window = _ax_get_main_window(_ax_get_kakao_app_element())
+        if window is None:
+            return False
+        msg_input = _ax_get_message_input(window)
+        if msg_input is None or not _ax_is_settable(msg_input, "AXValue"):
+            return False
+
+        # 메시지 입력 (AX) + 입력 검증
+        if _ax_is_settable(msg_input, "AXFocused"):
+            _ax_set(msg_input, "AXFocused", True)
+            time.sleep(0.05)
+        if not _ax_set(msg_input, "AXValue", message):
+            return False
+        time.sleep(0.2)
+        if str(_ax_copy(msg_input, "AXValue")) != message:
+            _ax_set(msg_input, "AXValue", "")
+            return False
+
+        # 전송: Enter
+        run_applescript('''
+        tell application "System Events"
+            tell process "KakaoTalk"
+                set frontmost to true
+                delay 0.15
+                key code 36
+            end tell
+        end tell
+        ''')
+
+        # 전송 확인: 입력창이 비워질 때까지 폴링한다.
+        # (Enter가 실제로 전송하면 입력창이 즉시 비워짐. 끝까지 안 비워지면 미전송으로 판정 →
+        #  입력창을 비우고 False를 반환해 호출부의 클립보드 폴백이 중복 없이 재시도하게 한다.)
+        for _ in range(10):
+            time.sleep(0.15)
+            remaining = _ax_copy(msg_input, "AXValue")
+            if remaining is None or str(remaining) == "":
+                return True
+        _ax_set(msg_input, "AXValue", "")
+        return False
+    except Exception as exc:
+        log(f"   -> ⚠️ AX 입력/전송 예외, 클립보드 방식으로 폴백: {exc}")
+        try:
+            if msg_input is not None:
+                _ax_set(msg_input, "AXValue", "")
+        except Exception:
+            pass
+        return False
+
+
 def verify_friend_by_ax(name: str) -> bool:
     """접근성(AX) API로 친구 검증. 확인되면 True, 아니면 False.
 
@@ -606,9 +833,16 @@ def verify_friend_by_ax(name: str) -> bool:
         if not names:
             return False
 
-        # 1) 정확 일치 (가장 흔한 경로 — 로그는 호출부의 '친구 확인됨 (AX)'로 통합)
-        if normalized in names:
+        # 1) 정확 일치 (이모티콘 표현형 차이는 정규화로 흡수: ❤ == ❤️, 한글 조합/분해형)
+        #    가장 흔한 경로 — 로그는 호출부의 '친구 확인됨 (AX)'로 통합.
+        canon_target = canonicalize_name(name)
+        if any(canonicalize_name(n) == canon_target for n in names):
             return True
+
+        # 이모티콘이 포함된 이름은 오발송 방지를 위해 '정확 일치'만 허용한다.
+        # (이모티콘을 떼면 텍스트가 같은 다른 친구에게 잘못 보내는 일을 원천 차단)
+        if name_contains_emoji_or_symbol(name):
+            return False
 
         # 2) 장식기호 제거 후 일치
         decorated_matches = {n for n in names if normalize_name_for_ocr_match(n) == decorated_normalized}
@@ -731,7 +965,6 @@ def _log_ocr_failure_diagnostics(name: str, window_id: int, texts: List[str]) ->
 
 def send_message_to_friend(message: str):
     """채팅방에서 메시지 전송 (메뉴 클릭 방식). 채팅방 열린 직후 창 크기 재고정."""
-    pyperclip.copy(message)
     db = CHAT_DELAY_BEFORE_ENTER
     da = CHAT_DELAY_AFTER_ENTER
 
@@ -754,33 +987,49 @@ def send_message_to_friend(message: str):
     time.sleep(0.8)
     resize_kakaotalk_window(silent=True)
 
-    # 메시지 붙여넣기 → 전송 → 채팅방 닫기
-    send_script = '''
+    # 1순위: AX로 메시지 입력 + 전송 버튼 AXPress (키보드 비의존, 클립보드 미사용)
+    sent_by_ax = _ax_input_and_send(message)
+
+    # 2순위: AX 실패 시 기존 방식(클립보드 붙여넣기 + Enter)으로 폴백
+    if not sent_by_ax:
+        # 붙여넣기 직전에 복사 — Handoff로 인한 클립보드 오염 위험을 최소화
+        _reliable_copy(message)
+        paste_send_script = '''
+        tell application "System Events"
+            tell process "KakaoTalk"
+                set frontmost to true
+                try
+                    click menu item "붙여넣기" of menu "편집" of menu bar 1
+                on error
+                    try
+                        click menu item "Paste" of menu "편집" of menu bar 1
+                    on error
+                        try
+                            click menu item "Paste" of menu "Edit" of menu bar 1
+                        end try
+                    end try
+                end try
+            end tell
+            delay 0.5
+            key code 36
+            delay 0.5
+        end tell
+        '''
+        run_applescript(paste_send_script)
+
+    # 채팅방 닫기 (Esc 2회) — AX/키 입력 경로 공통
+    close_script = '''
     tell application "System Events"
         tell process "KakaoTalk"
             set frontmost to true
-            try
-                click menu item "붙여넣기" of menu "편집" of menu bar 1
-            on error
-                try
-                    click menu item "Paste" of menu "편집" of menu bar 1
-                on error
-                    try
-                        click menu item "Paste" of menu "Edit" of menu bar 1
-                    end try
-                end try
-            end try
+            key code 53
+            delay 0.4
+            key code 53
+            delay 0.3
         end tell
-        delay 0.5
-        key code 36
-        delay 0.5
-        key code 53
-        delay 0.5
-        key code 53
-        delay 0.3
     end tell
     '''
-    run_applescript(send_script)
+    run_applescript(close_script)
 
 
 def open_chat_then_close(wait_seconds: float = 1.0):
@@ -1004,6 +1253,17 @@ HTML_TEMPLATE = '''
             font-size: 12px;
             margin-bottom: 10px;
         }
+        .emoji-note {
+            background: #fff8e1;
+            border: 1px solid #ffe082;
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin: 12px 0;
+            color: #7a5c00;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+        .emoji-note b { color: #5c4400; }
         .message-hint code {
             background: #e9ecef;
             padding: 2px 6px;
@@ -1233,6 +1493,14 @@ HTML_TEMPLATE = '''
                 <div>엑셀 파일을 선택하거나 드래그하세요 (.xlsx)</div>
                 <div class="file-name" id="fileName"></div>
                 <input type="file" id="fileInput" accept=".xlsx" onchange="handleFileSelect(this)">
+            </div>
+
+            <!-- 이모티콘 이름 주의 안내 -->
+            <div class="emoji-note">
+                💡 이름에 <b>이모티콘</b>이 있어도 전송할 수 있습니다. 단, 안전을 위해 이모티콘 이름은
+                <b>카카오톡 표시 이름과 글자·이모티콘까지 완전히 동일</b>할 때만 전송됩니다.<br>
+                ⚠️ 이모티콘을 <b>직접 손으로 입력</b>(다른 키보드·이모지 피커)하면 같은 모양이라도 내부 코드가 달라
+                전송이 안 될 수 있어요. 가급적 <b>카카오톡 이름을 복사해 붙여넣기</b> 하세요.
             </div>
 
             <!-- 발송 메시지 입력 -->
@@ -1823,13 +2091,17 @@ def send_message(name: str, message: str, dry_run: bool = False) -> bool:
         resize_kakaotalk_window(silent=True)
 
         # 2~3. 친구 검색 + AX/OCR 검증 (검색 화면이 안 떴거나 타이밍 문제일 수 있어 1회 재시도)
+        #  - 이모티콘 포함 이름: 검색은 '텍스트만'으로(필터 신뢰성↑), 검증은 이모티콘까지
+        #    포함한 정확 일치(AX)만 사용. OCR은 이모티콘을 못 읽어 정확 일치가 불가하므로 제외.
+        is_emoji_name = name_contains_emoji_or_symbol(name)
+        search_term = name_for_search(name)
         verified = False
         verify_method = None
         for attempt in range(MAX_SEARCH_OCR_ATTEMPTS):
             check_stop_requested()
             suffix = f" (재시도 {attempt}/{MAX_SEARCH_OCR_ATTEMPTS - 1})" if attempt else ""
             log(f"   -> 📋 검색 중...{suffix}")
-            search_ok = search_friend(name)
+            search_ok = search_friend(search_term)
             if not search_ok:
                 log("   -> ⚠️ 검색창 입력 검증에 실패했지만 AX/OCR로 추가 확인을 시도합니다.")
             safe_sleep((0.8, 1.2))  # 검색 결과 로딩 대기 (랜덤, 중단 체크 포함)
@@ -1840,6 +2112,14 @@ def send_message(name: str, message: str, dry_run: bool = False) -> bool:
                 verified = True
                 verify_method = "AX"
                 break
+
+            # 이모티콘 이름은 OCR로 정확 일치가 불가능하므로 OCR 폴백을 건너뛴다(오발송 방지).
+            if is_emoji_name:
+                if attempt < MAX_SEARCH_OCR_ATTEMPTS - 1:
+                    log("   -> ↻ 검색을 한 번 더 시도합니다.")
+                    reset_search_and_resize(silent=True)
+                    safe_sleep((0.5, 1.0))
+                continue
 
             # 2순위: AX 미확인 시에만 OCR 폴백. OCR은 창 크기에 민감하므로
             #        이 경로에서만 창 고정 + 창 확인을 수행한다 (성공 경로 속도 향상).
@@ -1869,7 +2149,10 @@ def send_message(name: str, message: str, dry_run: bool = False) -> bool:
                 safe_sleep((0.5, 1.0))
 
         if not verified:
-            log(f"   -> ❌ '{name}' 친구를 찾을 수 없습니다. (AX·OCR 검증 실패)")
+            if is_emoji_name:
+                log(f"   -> ❌ '{name}' 친구를 찾을 수 없습니다. (이모티콘 정확 일치 실패 — 카카오톡 표시 이름과 이모티콘까지 동일해야 합니다)")
+            else:
+                log(f"   -> ❌ '{name}' 친구를 찾을 수 없습니다. (AX·OCR 검증 실패)")
             return False
 
         log(f"   -> ✅ 친구 확인됨 ({verify_method})")
@@ -1960,14 +2243,15 @@ def run_sending_logic():
             }))
             return
 
-        # 이모티콘/감지 기호 포함 이름 차단 (OCR·환경 이슈 방지)
-        emoji_rows = target_df['이름'].apply(name_contains_emoji_or_symbol)
-        if emoji_rows.any():
-            bad_names = target_df.loc[emoji_rows, '이름'].unique().tolist()
+        # 텍스트 없이 이모티콘/기호만으로 된 이름만 차단 (AX로도 안전한 정확 검증이 불가).
+        # 텍스트가 있는 이모티콘 이름(예: '홍길동🍪')은 AX 정확 일치로 안전하게 지원한다.
+        emoji_only_rows = target_df['이름'].apply(lambda x: not normalize_name_for_ocr_match(x))
+        if emoji_only_rows.any():
+            bad_names = target_df.loc[emoji_only_rows, '이름'].unique().tolist()
             names_str = ', '.join(str(x) for x in bad_names)
-            log(f"❌ 이모티콘 오류: 이름에 이모티콘 또는 지원하지 않는 기호가 포함된 행이 있습니다 → {names_str}")
-            log("🚫 이모티콘이 포함된 이름은 자동 전송에서 지원하지 않아 실행을 중단합니다.")
-            log("📋 엑셀에서 이모티콘을 제거하거나, 카카오톡 표시 이름과 맞게 텍스트만 남긴 후 다시 시도해주세요.")
+            log(f"❌ 이름 오류: 텍스트 없이 이모티콘/기호만으로 된 이름이 있습니다 → {names_str}")
+            log("🚫 이런 이름은 안전한 검증이 어려워 실행을 중단합니다.")
+            log("📋 엑셀에서 해당 이름에 카카오톡 표시 이름의 텍스트를 추가한 뒤 다시 시도해주세요.")
             log_queue.put(json.dumps({
                 'type': 'complete',
                 'success': 0,
