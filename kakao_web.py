@@ -36,6 +36,18 @@ try:
 except Exception:
     AX_AVAILABLE = False
 
+# 접근성 권한 '요청 프롬프트' API — 권한이 없을 때 macOS 표준 권한 요청 다이얼로그를
+# 띄워 사용자를 '시스템 설정 > 손쉬운 사용' 패널로 바로 유도한다.
+# (구버전 pyobjc 등에서 심볼이 없을 수 있어 별도 try로 감싸 기본 AX 경로를 막지 않는다.)
+try:
+    from ApplicationServices import (
+        AXIsProcessTrustedWithOptions,
+        kAXTrustedCheckOptionPrompt,
+    )
+    AX_PROMPT_AVAILABLE = AX_AVAILABLE
+except Exception:
+    AX_PROMPT_AVAILABLE = False
+
 # 접근성(AX) '쓰기' 경로 — 검색어/메시지 입력과 전송을 키보드 없이 처리하기 위한 API.
 # 사용 불가 시 자동으로 기존 AppleScript(키 입력) 방식으로 폴백한다.
 try:
@@ -50,7 +62,7 @@ except Exception:
 # ============================================================
 # 설정
 # ============================================================
-VERSION = "1.0.14"
+VERSION = "1.0.15"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 카카오톡 자동화 튜닝 (다른 맥에서 검색/채팅 진입 안정화)
 SEARCH_RESULT_DOWN_ARROW_COUNT = 2
@@ -828,6 +840,54 @@ def verify_friend_by_ax(name: str) -> bool:
         return False
 
 
+def get_ax_permission_state() -> dict:
+    """접근성(AX) 권한 상태를 진단해 반환한다.
+
+    state:
+      - 'no_library'    : pyobjc 등 AX 라이브러리 자체가 없음(설치 문제)
+      - 'no_permission' : 라이브러리는 있으나 이 프로세스에 손쉬운 사용 권한 미부여
+      - 'ok'            : 친구 검증/입력 가능
+
+    친구 검증이 AX 단독(OCR 폴백 없음)이므로, 권한이 없으면 전 대상이 실패한다.
+    전송 시작 전 이 게이트로 한 번에 차단하고 명확히 안내하기 위한 함수.
+    """
+    if not AX_AVAILABLE:
+        return {
+            'state': 'no_library',
+            'message': (
+                '접근성 라이브러리(pyobjc)가 설치되어 있지 않습니다. '
+                '실행 스크립트(카카오톡전송기.command)를 다시 실행해 패키지 설치를 완료해주세요.'
+            ),
+            'can_prompt': False,
+        }
+    if not AXIsProcessTrusted():
+        return {
+            'state': 'no_permission',
+            'message': (
+                '접근성(손쉬운 사용) 권한이 없어 카카오톡 친구를 확인할 수 없습니다.\n'
+                '시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용 에서 '
+                '이 프로그램을 실행한 앱(보통 "터미널")을 켜주세요.\n'
+                '권한을 켠 뒤에도 안 되면 그 앱을 완전히 종료(⌘Q)했다가 다시 실행하세요.'
+            ),
+            'can_prompt': AX_PROMPT_AVAILABLE,
+        }
+    return {'state': 'ok', 'message': '접근성 권한이 확인되었습니다.', 'can_prompt': False}
+
+
+def request_ax_permission_prompt() -> dict:
+    """macOS 표준 '손쉬운 사용 권한 요청' 다이얼로그를 띄운다.
+
+    이 호출은 다이얼로그만 띄우고 '현재(아직 미부여) 상태'를 즉시 반환하므로,
+    반환값으로 통과시키지 말고 호출부에서 권한 부여 후 재확인(폴링)해야 한다.
+    """
+    if AX_PROMPT_AVAILABLE:
+        try:
+            AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
+        except Exception:
+            pass
+    return get_ax_permission_state()
+
+
 def send_message_to_friend(message: str):
     """채팅방에서 메시지 전송 (AX 입력 우선, 실패 시 클립보드 붙여넣기 폴백)."""
     db = CHAT_DELAY_BEFORE_ENTER
@@ -1294,9 +1354,71 @@ HTML_TEMPLATE = '''
             color: #856404;
             animation: pulse 1.5s infinite;
         }
+        .status-warn {
+            background: #f8d7da;
+            color: #842029;
+        }
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.6; }
+        }
+        .perm-panel {
+            border: 1px solid #f5c2c7;
+            background: #fff5f5;
+            border-radius: 12px;
+            padding: 16px 18px;
+            margin-bottom: 15px;
+            text-align: left;
+        }
+        .perm-panel .perm-title {
+            font-weight: bold;
+            color: #842029;
+            margin-bottom: 8px;
+        }
+        .perm-panel .perm-msg {
+            font-size: 13px;
+            color: #495057;
+            white-space: pre-line;
+            line-height: 1.55;
+            margin-bottom: 12px;
+        }
+        .perm-panel .perm-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+        }
+        .perm-panel .btn-perm, .perm-panel .btn-perm-sec {
+            border: none;
+            border-radius: 8px;
+            padding: 8px 14px;
+            font-size: 13px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .perm-panel .btn-perm {
+            background: #7c3aed;
+            color: #fff;
+        }
+        .perm-panel .btn-perm-sec {
+            background: #e9ecef;
+            color: #495057;
+        }
+        .perm-panel .btn-perm-close {
+            background: transparent;
+            border: none;
+            color: #adb5bd;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .perm-panel .perm-status {
+            font-size: 12px;
+            color: #856404;
+            margin-bottom: 4px;
+        }
+        .perm-panel .perm-hint {
+            font-size: 11px;
+            color: #adb5bd;
         }
         .footer {
             text-align: center;
@@ -1386,7 +1508,19 @@ HTML_TEMPLATE = '''
             </div>
             
             <span class="status-badge status-idle" id="statusBadge">대기 중</span>
-            
+
+            <div class="perm-panel" id="permPanel" style="display:none;">
+                <div class="perm-title">⚠️ 접근성(손쉬운 사용) 권한이 필요합니다</div>
+                <div class="perm-msg" id="permMsg"></div>
+                <div class="perm-actions">
+                    <button type="button" class="btn-perm" id="permRequestBtn" onclick="requestAxPermission()">🔓 권한 요청 팝업 열기</button>
+                    <button type="button" class="btn-perm-sec" onclick="recheckAxPermission()">🔄 다시 확인</button>
+                    <button type="button" class="btn-perm-close" onclick="closePermPanel()">✕ 닫기</button>
+                </div>
+                <div class="perm-status" id="permStatus">권한 상태를 확인하는 중...</div>
+                <div class="perm-hint">권한을 켠 뒤에도 안 되면 실행한 앱(터미널)을 완전히 종료(⌘Q)했다가 다시 실행하세요.</div>
+            </div>
+
             <button class="btn btn-start" id="startBtn" disabled onclick="startSending()">
                 🚀 카카오톡 전송 시작
             </button>
@@ -1411,6 +1545,7 @@ HTML_TEMPLATE = '''
         let selectedFile = null;
         let eventSource = null;
         let isPaused = false;
+        let axPollTimer = null;
         
         function toggleFilter(btn) {
             btn.classList.toggle('active');
@@ -1486,12 +1621,11 @@ HTML_TEMPLATE = '''
         
         function startSending() {
             if (!selectedFile) return;
-            
+
             const registerTypes = getSelectedValues('registerTypeButtons');
             const ageGroups = getSelectedValues('ageGroupButtons');
             const messageText = document.getElementById('messageText').value;
-            const dryRun = document.getElementById('dryRunCheck').checked;
-            
+
             if (registerTypes.length === 0) {
                 alert('등록형태를 최소 1개 이상 선택해주세요.');
                 return;
@@ -1504,10 +1638,34 @@ HTML_TEMPLATE = '''
                 alert('발송 메시지를 입력해주세요.');
                 return;
             }
-            
+
+            // 사전 점검: 접근성 권한이 없으면 시작 자체를 막고 안내 패널을 띄운다.
+            document.getElementById('startBtn').disabled = true;
+            fetch('/ax_status')
+                .then(r => r.json())
+                .then(s => {
+                    if (s.state === 'ok') {
+                        closePermPanel();
+                        beginSendFlow();
+                    } else {
+                        showPermPanel(s);
+                    }
+                })
+                .catch(() => {
+                    // 상태 확인 자체가 실패하면 일단 진행 (서버측 /start 게이트가 최종 방어선)
+                    beginSendFlow();
+                });
+        }
+
+        function beginSendFlow() {
+            const registerTypes = getSelectedValues('registerTypeButtons');
+            const ageGroups = getSelectedValues('ageGroupButtons');
+            const messageText = document.getElementById('messageText').value;
+            const dryRun = document.getElementById('dryRunCheck').checked;
+
             const formData = new FormData();
             formData.append('file', selectedFile);
-            
+
             document.getElementById('startBtn').style.display = 'none';
             document.getElementById('pauseBtn').style.display = 'block';
             document.getElementById('pauseBtn').disabled = false;
@@ -1518,7 +1676,7 @@ HTML_TEMPLATE = '''
             document.getElementById('stopBtn').textContent = '⏹ 전송 중단';
             document.getElementById('statusBadge').className = 'status-badge status-running';
             document.getElementById('statusBadge').textContent = '전송 중...';
-            
+
             // 파일 업로드
             fetch('/upload', {
                 method: 'POST',
@@ -1540,7 +1698,21 @@ HTML_TEMPLATE = '''
                             message_template: messageText,
                             dry_run: dryRun
                         })
-                    });
+                    })
+                    .then(r => r.json())
+                    .then(d => {
+                        // /start가 거부되면(권한 변동 등) 스트림을 닫고 안내 패널을 띄운다.
+                        if (!d.success) {
+                            if (eventSource) { eventSource.close(); }
+                            addLog('❌ ' + (d.error || '전송을 시작할 수 없습니다.'), 'error');
+                            if (d.error_code === 'no_permission' || d.error_code === 'no_library') {
+                                showPermPanel({ state: d.error_code, message: d.error, can_prompt: d.can_prompt });
+                            } else {
+                                resetUI();
+                            }
+                        }
+                    })
+                    .catch(() => { /* 정상 진행 시 결과는 로그 스트림으로 전달됨 */ });
                 } else {
                     addLog('❌ 오류: ' + data.error, 'error');
                     resetUI();
@@ -1550,6 +1722,77 @@ HTML_TEMPLATE = '''
                 addLog('❌ 업로드 실패: ' + error, 'error');
                 resetUI();
             });
+        }
+
+        // ===== 접근성(AX) 권한 안내/요청 =====
+        function showPermPanel(s) {
+            resetUI();
+            document.getElementById('statusBadge').className = 'status-badge status-warn';
+            document.getElementById('statusBadge').textContent = '권한 필요';
+            document.getElementById('permMsg').textContent = s.message || '';
+            const reqBtn = document.getElementById('permRequestBtn');
+            reqBtn.style.display = (s.state === 'no_permission' && s.can_prompt !== false) ? 'inline-block' : 'none';
+            document.getElementById('permStatus').textContent = '⏳ 권한을 켜면 자동으로 전송이 시작됩니다.';
+            document.getElementById('permPanel').style.display = 'block';
+            startAxPolling();
+        }
+
+        function closePermPanel() {
+            stopAxPolling();
+            document.getElementById('permPanel').style.display = 'none';
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('statusBadge').className = 'status-badge status-idle';
+            document.getElementById('statusBadge').textContent = '대기 중';
+        }
+
+        function startAxPolling() {
+            stopAxPolling();
+            axPollTimer = setInterval(() => {
+                fetch('/ax_status')
+                    .then(r => r.json())
+                    .then(s => {
+                        if (s.state === 'ok') {
+                            stopAxPolling();
+                            document.getElementById('permStatus').textContent = '✅ 권한이 확인되었습니다. 전송을 시작합니다...';
+                            addLog('✅ 접근성 권한이 확인되었습니다.', 'success');
+                            setTimeout(() => {
+                                document.getElementById('permPanel').style.display = 'none';
+                                beginSendFlow();
+                            }, 800);
+                        } else {
+                            document.getElementById('permMsg').textContent = s.message || '';
+                        }
+                    })
+                    .catch(() => {});
+            }, 1500);
+        }
+
+        function stopAxPolling() {
+            if (axPollTimer) { clearInterval(axPollTimer); axPollTimer = null; }
+        }
+
+        function requestAxPermission() {
+            document.getElementById('permStatus').textContent = '시스템 권한 요청 팝업을 띄웠습니다. "시스템 설정 열기"를 눌러 권한을 켜주세요.';
+            fetch('/ax_request_permission', { method: 'POST' })
+                .then(r => r.json())
+                .then(s => { document.getElementById('permMsg').textContent = s.message || ''; })
+                .catch(() => {});
+        }
+
+        function recheckAxPermission() {
+            fetch('/ax_status')
+                .then(r => r.json())
+                .then(s => {
+                    if (s.state === 'ok') {
+                        document.getElementById('permPanel').style.display = 'none';
+                        stopAxPolling();
+                        beginSendFlow();
+                    } else {
+                        document.getElementById('permMsg').textContent = s.message || '';
+                        document.getElementById('permStatus').textContent = '⏳ 아직 권한이 없습니다. 설정에서 권한을 켜주세요.';
+                    }
+                })
+                .catch(() => {});
         }
         
         function stopSending() {
@@ -1684,6 +1927,18 @@ def upload_file():
         return jsonify({'success': False, 'error': str(e)})
 
 
+@app.route('/ax_status')
+def ax_status():
+    """접근성(AX) 권한 상태 조회 — 프론트의 사전 점검·폴링용."""
+    return jsonify(get_ax_permission_state())
+
+
+@app.route('/ax_request_permission', methods=['POST'])
+def ax_request_permission():
+    """macOS 표준 손쉬운 사용 권한 요청 다이얼로그를 띄우고 현재 상태를 반환."""
+    return jsonify(request_ax_permission_prompt())
+
+
 @app.route('/start', methods=['POST'])
 def start_sending():
     global is_running, stop_requested
@@ -1691,7 +1946,17 @@ def start_sending():
     
     if is_running:
         return jsonify({'success': False, 'error': '이미 실행 중입니다'})
-    
+
+    # 사전 점검(preflight): 접근성 권한이 없으면 한 명도 보낼 수 없으므로 시작 자체를 차단한다.
+    perm = get_ax_permission_state()
+    if perm['state'] != 'ok':
+        return jsonify({
+            'success': False,
+            'error_code': perm['state'],
+            'error': perm['message'],
+            'can_prompt': perm.get('can_prompt', False),
+        })
+
     data = request.get_json() or {}
     current_register_types = data.get('register_types', DEFAULT_REGISTER_TYPES)
     current_age_groups = data.get('age_groups', DEFAULT_AGE_GROUPS)
