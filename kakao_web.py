@@ -7,6 +7,7 @@
 import os
 import sys
 import re
+import csv
 import unicodedata
 import tempfile
 import subprocess
@@ -14,6 +15,7 @@ import threading
 import time
 import random
 import webbrowser
+from contextlib import contextmanager
 from queue import Queue, Empty
 from datetime import datetime
 from typing import Optional, List
@@ -62,7 +64,7 @@ except Exception:
 # ============================================================
 # 설정
 # ============================================================
-VERSION = "1.0.15"
+VERSION = "1.0.16"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 카카오톡 자동화 튜닝 (다른 맥에서 검색/채팅 진입 안정화)
 SEARCH_RESULT_DOWN_ARROW_COUNT = 2
@@ -86,6 +88,108 @@ CHAT_DELAY_BEFORE_ENTER = 0.55
 CHAT_DELAY_AFTER_ENTER = 1.35
 # 업로드 파일은 스크립트 폴더가 아닌 시스템 임시 디렉터리에 저장 (폴더명 공백·복사본 경로 등으로 인한 ENOENT 방지)
 UPLOAD_TEMP_XLSX = os.path.join(tempfile.gettempdir(), f'kakao_sender_upload_{os.getpid()}.xlsx')
+
+# ============================================================
+# 단계별 소요시간 계측 (B단계) — 패스트 모드 설계를 위한 실측 도구.
+# 사용자 로그(log_queue)와 분리된 채널로 기록하고, 전송 종료 시 CSV로 덤프 +
+# 요약 몇 줄만 로그에 남긴다. 계측 오버헤드는 perf_counter 호출(마이크로초급)뿐.
+# 비활성화하려면 TIMING_ENABLED = False.
+# ============================================================
+TIMING_ENABLED = True
+TIMING_DIR = os.path.join(tempfile.gettempdir(), 'kakao_sender_timing')
+_timing_records = []  # list[tuple(idx, name, stage, seconds)]
+_timing_lock = threading.Lock()
+_timing_ctx = {'idx': None, 'name': None}
+# 단계 출력 순서(요약 표 정렬용)
+TIMING_STAGE_ORDER = [
+    'ensure_ready', 'search', 'search_result_wait', 'verify_ax',
+    'open_chat', 'layout_wait', 'ax_input_send', 'close_chat',
+    'send_total', 'post_send_wait', 'reset_search', 'person_total',
+]
+
+
+def set_timing_context(idx, name):
+    """이번에 처리할 대상자 정보를 계측 컨텍스트에 설정 (전송 스레드 단일 → 전역 안전)."""
+    _timing_ctx['idx'] = idx
+    _timing_ctx['name'] = name
+
+
+@contextmanager
+def time_stage(stage: str):
+    """with 블록의 소요시간을 단계명과 함께 기록. TIMING_ENABLED=False면 무동작."""
+    if not TIMING_ENABLED:
+        yield
+        return
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        with _timing_lock:
+            _timing_records.append((_timing_ctx['idx'], _timing_ctx['name'], stage, dt))
+
+
+def reset_timing():
+    """새 전송 시작 시 이전 계측 기록을 비운다."""
+    with _timing_lock:
+        _timing_records.clear()
+
+
+def dump_timing_summary():
+    """누적된 계측 기록을 CSV로 저장하고, 단계별 요약을 사용자 로그로 남긴다.
+    반환: 저장된 CSV 경로(또는 None)."""
+    if not TIMING_ENABLED:
+        return None
+    with _timing_lock:
+        records = list(_timing_records)
+    if not records:
+        return None
+
+    # 단계별 집계
+    by_stage = {}
+    for _idx, _name, stage, sec in records:
+        by_stage.setdefault(stage, []).append(sec)
+
+    def stat(vals):
+        n = len(vals)
+        avg = sum(vals) / n
+        s = sorted(vals)
+        mid = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+        return n, avg, mid, min(vals), max(vals)
+
+    person_totals = by_stage.get('person_total', [])
+    n_people = len(person_totals)
+
+    # CSV 덤프 (raw + 요약)
+    csv_path = None
+    try:
+        os.makedirs(TIMING_DIR, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        csv_path = os.path.join(TIMING_DIR, f'timing_{ts}.csv')
+        with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+            w = csv.writer(f)
+            w.writerow(['idx', 'name', 'stage', 'seconds'])
+            for idx, name, stage, sec in records:
+                w.writerow([idx, name, stage, f'{sec:.4f}'])
+    except Exception:
+        csv_path = None
+
+    # 요약 로그 (단계 순서대로)
+    ordered = [s for s in TIMING_STAGE_ORDER if s in by_stage]
+    ordered += [s for s in by_stage if s not in TIMING_STAGE_ORDER]
+    log("⏱ 단계별 소요시간(계측) — 평균/중앙값/최소/최대 (초)")
+    for stage in ordered:
+        if stage == 'person_total':
+            continue
+        n, avg, mid, lo, hi = stat(by_stage[stage])
+        log(f"   • {stage:<18} avg {avg:5.2f} | med {mid:5.2f} | {lo:5.2f}~{hi:5.2f} (n={n})")
+    if person_totals:
+        n, avg, mid, lo, hi = stat(person_totals)
+        log(f"   ▷ 1인당 합계        avg {avg:5.2f} | med {mid:5.2f} | {lo:5.2f}~{hi:5.2f} (n={n})")
+        log(f"   ▷ {n_people}명 추정 총시간 ≈ {avg * n_people:.0f}초 (≈ {avg * n_people / 60:.1f}분)")
+    if csv_path:
+        log(f"   🗂 상세 CSV: {csv_path}")
+    return csv_path
 
 # 선택 가능한 필터 옵션
 AVAILABLE_REGISTER_TYPES = ['이월', '재등록', '신규', '이탈', '이탈(단)']
@@ -136,6 +240,16 @@ current_register_types = None
 current_age_groups = None
 current_message_template = None
 current_dry_run = False  # 모의 전송(테스트) 모드: 실제 메시지 발송을 생략
+# 패스트 모드: 고정 대기를 상태 폴링으로 바꾸고 AppleScript delay를 최소화하며,
+# 매크로 탐지 방지용 대기(대상 간/전송 후)를 제거한다.
+# ⚠️ 빠른 연속 발송은 카카오톡 스팸/매크로 탐지로 계정이 제한될 수 있다.
+current_fast_mode = False
+
+
+def fast_delay(normal: float, fast: float) -> float:
+    """현재 모드에 따른 지연값(초). 패스트 모드면 fast, 아니면 normal을 반환.
+    AppleScript의 'delay {fast_delay(...)}'와 Python time.sleep 양쪽에 공용으로 쓴다."""
+    return fast if current_fast_mode else normal
 
 
 @app.errorhandler(Exception)
@@ -251,26 +365,28 @@ tell application "KakaoTalk" to activate
 '''
 
 # 검색창 초기화 (다음 검색을 위해)
-SCRIPT_RESET_SEARCH = '''
+def _reset_search_script() -> str:
+    """다음 검색 준비 스크립트(모드별 delay): Esc 3회로 레이어 닫고 Cmd+1로 친구 목록 복귀."""
+    return f'''
 tell application "KakaoTalk" to activate
-delay 0.3
+delay {fast_delay(0.3, 0.15)}
 tell application "System Events"
     tell process "KakaoTalk"
         set frontmost to true
     end tell
-    delay 0.2
-    
+    delay {fast_delay(0.2, 0.1)}
+
     -- 1. Esc 3회 (채팅창/검색창/알림 등 모든 레이어 닫기)
     key code 53
-    delay 0.3
+    delay {fast_delay(0.3, 0.1)}
     key code 53
-    delay 0.3
+    delay {fast_delay(0.3, 0.1)}
     key code 53
-    delay 0.3
-    
+    delay {fast_delay(0.3, 0.1)}
+
     -- 2. 친구 목록으로 이동 (Cmd+1)
     keystroke "1" using command down
-    delay 0.5
+    delay {fast_delay(0.5, 0.2)}
 end tell
 '''
 
@@ -349,10 +465,10 @@ def ensure_kakaotalk_ready() -> Optional[int]:
     
     for attempt in range(max_retries):
         # 카카오톡 활성화
-        script = '''
+        script = f'''
         tell application "KakaoTalk"
             activate
-            delay 0.5
+            delay {fast_delay(0.5, 0.15)}
         end tell
         tell application "System Events"
             tell process "KakaoTalk"
@@ -360,13 +476,13 @@ def ensure_kakaotalk_ready() -> Optional[int]:
                 -- 창이 없으면 새 창 열기 시도
                 if (count of windows) is 0 then
                     keystroke "n" using command down
-                    delay 0.5
+                    delay {fast_delay(0.5, 0.3)}
                 end if
             end tell
         end tell
         '''
         run_applescript(script)
-        time.sleep(0.5)
+        time.sleep(fast_delay(0.5, 0.1))
         
         # 창 확인: 카카오톡 UI 전환 중 일시적으로 창 목록이 비는 경우가 있어 짧게 대기
         window_id = wait_for_kakaotalk_window(timeout=2.0)
@@ -387,26 +503,26 @@ def _paste_into_search(name: str, use_keystroke: bool) -> None:
     """
     # AX 경로: 검색창 열기 → 필드 노출용 1글자 입력 → AX로 전체 값 덮어쓰기
     if AX_WRITE_AVAILABLE and USE_AX_INPUT and not use_keystroke:
-        prime_script = '''
+        prime_script = f'''
         tell application "KakaoTalk" to activate
-        delay 0.3
+        delay {fast_delay(0.3, 0.15)}
         tell application "System Events"
             tell process "KakaoTalk"
                 set frontmost to true
             end tell
-            delay 0.2
+            delay {fast_delay(0.2, 0.1)}
             key code 53
-            delay 0.2
+            delay {fast_delay(0.2, 0.1)}
             keystroke "1" using command down
-            delay 0.3
+            delay {fast_delay(0.3, 0.15)}
             key code 3 using command down
-            delay 0.4
+            delay {fast_delay(0.4, 0.25)}
             keystroke "."
-            delay 0.3
+            delay {fast_delay(0.3, 0.15)}
         end tell
         '''
         run_applescript(prime_script)
-        time.sleep(0.2)
+        time.sleep(fast_delay(0.2, 0.1))
         if _ax_write_search(name):
             return
         # AX 실패 → 아래 키 입력 폴백 (Cmd+A + delete로 프라임 문자 '.'까지 함께 정리됨)
@@ -515,7 +631,7 @@ def _move_focus_to_search_results() -> None:
         end tell
         repeat with _k from 1 to {n_down}
             key code 125
-            delay 0.2
+            delay {fast_delay(0.2, 0.1)}
         end repeat
     end tell
     '''
@@ -534,7 +650,7 @@ def search_friend(name: str) -> bool:
     for attempt in range(SEARCH_INPUT_VERIFY_ATTEMPTS):
         use_keystroke = attempt > 0  # 1회차는 메뉴 클릭, 재시도부터 Cmd+V
         _paste_into_search(name, use_keystroke=use_keystroke)
-        time.sleep(0.3)
+        time.sleep(fast_delay(0.3, 0.1))
         actual = normalize_name(_read_search_field_text())
         if actual == expected:
             verified = True
@@ -761,6 +877,37 @@ def _ax_input_and_send(message: str) -> bool:
         return False
 
 
+def _ax_wait_for_search_results(timeout: float = 1.2, interval: float = 0.05) -> bool:
+    """검색 결과 행(AXStaticText)이 나타날 때까지 폴링. (패스트 모드의 고정 대기 대체)
+    결과가 빨리 뜨면 즉시 True로 반환하고, 안 뜨면 timeout까지 기다린 뒤 False.
+    AX를 못 쓰는 환경이면 timeout 동안 폴링하다 빠지므로 기존 고정 대기와 동급(상한)."""
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        try:
+            window = _ax_get_main_window(_ax_get_kakao_app_element())
+            if window is not None and _ax_collect_result_names(window):
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
+
+
+def _ax_wait_for_message_input(timeout: float = 1.5, interval: float = 0.05) -> bool:
+    """채팅방 메시지 입력창(AXTextArea)이 나타날 때까지 폴링. (패스트 모드의 레이아웃 대기 대체)
+    입력창이 준비된 시점에만 다음 단계로 진행하므로 미입력/오입력 실패율을 낮춘다."""
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        try:
+            window = _ax_get_main_window(_ax_get_kakao_app_element())
+            if window is not None and _ax_get_message_input(window) is not None:
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
+
+
 def verify_friend_by_ax(name: str) -> bool:
     """접근성(AX) API로 친구 검증. 확인되면 True, 아니면 False.
 
@@ -890,13 +1037,15 @@ def request_ax_permission_prompt() -> dict:
 
 def send_message_to_friend(message: str):
     """채팅방에서 메시지 전송 (AX 입력 우선, 실패 시 클립보드 붙여넣기 폴백)."""
-    db = CHAT_DELAY_BEFORE_ENTER
-    da = CHAT_DELAY_AFTER_ENTER
+    db = fast_delay(CHAT_DELAY_BEFORE_ENTER, 0.2)
+    # 패스트 모드: Enter 후 레이아웃 대기를 고정 da 대신 '입력창 등장 폴링'으로 처리하므로
+    # AppleScript 내부 da는 짧게 두고, 실제 대기는 아래 layout_wait 폴링이 담당한다.
+    da = fast_delay(CHAT_DELAY_AFTER_ENTER, 0.2)
 
     # 채팅방 열기
     open_script = f'''
     tell application "KakaoTalk" to activate
-    delay 0.3
+    delay {fast_delay(0.3, 0.15)}
     tell application "System Events"
         tell process "KakaoTalk"
             set frontmost to true
@@ -906,13 +1055,20 @@ def send_message_to_friend(message: str):
         delay {da}
     end tell
     '''
-    run_applescript(open_script)
+    with time_stage('open_chat'):
+        run_applescript(open_script)
 
-    # 채팅방 레이아웃 전환이 끝날 때까지 잠시 대기 (AX 입력은 창 크기와 무관)
-    time.sleep(0.8)
+    # 채팅방 레이아웃 전환 대기. 패스트 모드는 입력창이 실제로 뜰 때까지 폴링해
+    # (고정 0.8초 대신) 빠르면 즉시 진행하고 느릴 때만 기다린다 → 속도+신뢰성.
+    with time_stage('layout_wait'):
+        if current_fast_mode:
+            _ax_wait_for_message_input(timeout=1.5)
+        else:
+            time.sleep(0.8)
 
     # 1순위: AX로 메시지 입력 + 전송 버튼 AXPress (키보드 비의존, 클립보드 미사용)
-    sent_by_ax = _ax_input_and_send(message)
+    with time_stage('ax_input_send'):
+        sent_by_ax = _ax_input_and_send(message)
 
     # 2순위: AX 실패 시 기존 방식(클립보드 붙여넣기 + Enter)으로 폴백
     if not sent_by_ax:
@@ -941,19 +1097,22 @@ def send_message_to_friend(message: str):
         '''
         run_applescript(paste_send_script)
 
-    # 채팅방 닫기 (Esc 2회) — AX/키 입력 경로 공통
-    close_script = '''
-    tell application "System Events"
-        tell process "KakaoTalk"
-            set frontmost to true
-            key code 53
-            delay 0.4
-            key code 53
-            delay 0.3
+    # 채팅방 닫기 (Esc 2회) — AX/키 입력 경로 공통.
+    # 패스트 모드는 직후 reset_search(Esc 3회 + Cmd+1)가 모든 레이어를 닫으므로 생략(중복 제거).
+    if not current_fast_mode:
+        close_script = '''
+        tell application "System Events"
+            tell process "KakaoTalk"
+                set frontmost to true
+                key code 53
+                delay 0.4
+                key code 53
+                delay 0.3
+            end tell
         end tell
-    end tell
-    '''
-    run_applescript(close_script)
+        '''
+        with time_stage('close_chat'):
+            run_applescript(close_script)
 
 
 def open_chat_then_close(wait_seconds: float = 1.0):
@@ -961,13 +1120,13 @@ def open_chat_then_close(wait_seconds: float = 1.0):
 
     메시지 붙여넣기/전송은 하지 않는다. 채팅방 진입·복귀 흐름만 실전과 동일하게 검증한다.
     """
-    db = CHAT_DELAY_BEFORE_ENTER
-    da = CHAT_DELAY_AFTER_ENTER
+    db = fast_delay(CHAT_DELAY_BEFORE_ENTER, 0.2)
+    da = fast_delay(CHAT_DELAY_AFTER_ENTER, 0.2)
 
     # 채팅방 열기 (Enter)
     open_script = f'''
     tell application "KakaoTalk" to activate
-    delay 0.3
+    delay {fast_delay(0.3, 0.15)}
     tell application "System Events"
         tell process "KakaoTalk"
             set frontmost to true
@@ -979,23 +1138,27 @@ def open_chat_then_close(wait_seconds: float = 1.0):
     '''
     run_applescript(open_script)
 
-    # 채팅방 레이아웃 전환 대기 (실전과 동일)
-    time.sleep(0.8)
+    # 채팅방 레이아웃 전환 대기 (실전과 동일). 패스트는 입력창 등장 폴링으로 대체.
+    if current_fast_mode:
+        _ax_wait_for_message_input(timeout=1.5)
+    else:
+        time.sleep(0.8)
 
-    # 채팅방을 연 상태로 잠시 유지 (중단 요청은 즉시 반영)
-    safe_sleep((wait_seconds, wait_seconds))
+    # 채팅방을 연 상태로 잠시 유지 (중단 요청은 즉시 반영). 패스트 모드는 짧게.
+    hold = fast_delay(wait_seconds, 0.2)
+    safe_sleep((hold, hold))
 
-    # 채팅방 닫기 (Esc 2회)
-    close_script = '''
+    # 채팅방 닫기 (Esc 2회) — 모드별 delay
+    close_script = f'''
     tell application "System Events"
         tell process "KakaoTalk"
             set frontmost to true
         end tell
-        delay 0.2
+        delay {fast_delay(0.2, 0.1)}
         key code 53
-        delay 0.3
+        delay {fast_delay(0.3, 0.1)}
         key code 53
-        delay 0.3
+        delay {fast_delay(0.3, 0.1)}
     end tell
     '''
     run_applescript(close_script)
@@ -1235,6 +1398,34 @@ HTML_TEMPLATE = '''
         }
         .dryrun-label .dryrun-desc {
             color: #8d6e63;
+            font-size: 12px;
+        }
+        .fastmode-section {
+            background: #fdecec;
+            border: 1px solid #f5b7b7;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 20px;
+        }
+        .fastmode-label {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            cursor: pointer;
+            color: #842029;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        .fastmode-label input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            margin-top: 2px;
+            flex-shrink: 0;
+            cursor: pointer;
+            accent-color: #d6336c;
+        }
+        .fastmode-label .fastmode-desc {
+            color: #9c5560;
             font-size: 12px;
         }
         .btn {
@@ -1506,7 +1697,18 @@ HTML_TEMPLATE = '''
                     </span>
                 </label>
             </div>
-            
+
+            <!-- 패스트 모드 옵션 -->
+            <div class="fastmode-section">
+                <label class="fastmode-label">
+                    <input type="checkbox" id="fastModeCheck">
+                    <span>⚡ 패스트 모드<br>
+                        <span class="fastmode-desc">대기를 최소화하고 단계 대기를 폴링으로 바꿔 <b>전송 시간을 크게 줄입니다.</b><br>
+                        <b style="color:#b02a37;">⚠️ 대상 간 대기까지 제거하므로, 빠른 연속 발송이 카카오톡 스팸/매크로 탐지에 걸려 계정이 제한될 수 있습니다.</b> 위험을 감수할 때만 사용하세요.</span>
+                    </span>
+                </label>
+            </div>
+
             <span class="status-badge status-idle" id="statusBadge">대기 중</span>
 
             <div class="perm-panel" id="permPanel" style="display:none;">
@@ -1662,6 +1864,7 @@ HTML_TEMPLATE = '''
             const ageGroups = getSelectedValues('ageGroupButtons');
             const messageText = document.getElementById('messageText').value;
             const dryRun = document.getElementById('dryRunCheck').checked;
+            const fastMode = document.getElementById('fastModeCheck').checked;
 
             const formData = new FormData();
             formData.append('file', selectedFile);
@@ -1686,9 +1889,10 @@ HTML_TEMPLATE = '''
             .then(data => {
                 if (data.success) {
                     addLog('🚀 작업을 시작합니다...', 'info');
-                    // 먼저 로그 스트림을 연 뒤 전송 시작. 초기 로그는 서버 큐에 버퍼링되어
-                    // 스트림 연결 후 그대로 전달되므로(백엔드 epoch 가드로 단일 소비자 보장) 유실되지 않음.
-                    startLogStream();
+                    // 로그 스트림을 연결하고, 연결이 '열린 뒤'(onopen)에 전송을 시작한다.
+                    // 서버는 브로드캐스트만 하고 버퍼링하지 않으므로, 구독자 등록 전에 전송을
+                    // 시작하면 백엔드의 초기 로그(모의전송·패스트 모드 안내 등)가 유실된다.
+                    startLogStream(function() {
                     fetch('/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -1696,7 +1900,8 @@ HTML_TEMPLATE = '''
                             register_types: registerTypes,
                             age_groups: ageGroups,
                             message_template: messageText,
-                            dry_run: dryRun
+                            dry_run: dryRun,
+                            fast_mode: fastMode
                         })
                     })
                     .then(r => r.json())
@@ -1713,6 +1918,7 @@ HTML_TEMPLATE = '''
                         }
                     })
                     .catch(() => { /* 정상 진행 시 결과는 로그 스트림으로 전달됨 */ });
+                    });  // ← startLogStream onopen 콜백 끝
                 } else {
                     addLog('❌ 오류: ' + data.error, 'error');
                     resetUI();
@@ -1830,12 +2036,20 @@ HTML_TEMPLATE = '''
             });
         }
         
-        function startLogStream() {
+        function startLogStream(onReady) {
             if (eventSource) {
                 eventSource.close();
             }
-            
+
             eventSource = new EventSource('/logs');
+            let readyFired = false;
+            eventSource.onopen = function() {
+                // 구독자가 서버에 등록된 뒤 호출되므로, 여기서 전송을 시작해야 초기 로그가 유실되지 않는다.
+                if (onReady && !readyFired) {
+                    readyFired = true;
+                    onReady();
+                }
+            };
             eventSource.onmessage = function(event) {
                 const data = JSON.parse(event.data);
                 
@@ -1943,7 +2157,8 @@ def ax_request_permission():
 def start_sending():
     global is_running, stop_requested
     global current_register_types, current_age_groups, current_message_template, current_dry_run
-    
+    global current_fast_mode
+
     if is_running:
         return jsonify({'success': False, 'error': '이미 실행 중입니다'})
 
@@ -1962,7 +2177,8 @@ def start_sending():
     current_age_groups = data.get('age_groups', DEFAULT_AGE_GROUPS)
     current_message_template = data.get('message_template', DEFAULT_MESSAGE_TEMPLATE)
     current_dry_run = bool(data.get('dry_run', False))
-    
+    current_fast_mode = bool(data.get('fast_mode', False))
+
     is_running = True
     stop_requested = False
     pause_requested = False
@@ -2032,13 +2248,13 @@ def log(msg):
 
 def reset_search(silent=False) -> bool:
     """Esc·친구목록 복귀로 다음 검색을 준비. (AX 검증은 창 크기와 무관하므로 리사이즈하지 않음)"""
-    run_applescript(SCRIPT_RESET_SEARCH)
+    run_applescript(_reset_search_script())
     window_id = wait_for_kakaotalk_window(timeout=3.0)
     if not window_id:
         if not silent:
             log("   -> ⚠️ 다음 검색 준비 중 카카오톡 창 복구 대기 실패")
         return False
-    time.sleep(0.3)
+    time.sleep(fast_delay(0.3, 0.1))
     return True
 
 
@@ -2081,7 +2297,8 @@ def send_message(name: str, message: str, dry_run: bool = False) -> bool:
         check_stop_requested()
         
         # 1. 카카오톡 활성화 및 준비 확인
-        window_id = ensure_kakaotalk_ready()
+        with time_stage('ensure_ready'):
+            window_id = ensure_kakaotalk_ready()
         check_stop_requested()
         if not window_id:
             log(f"   -> ⚠️ 카카오톡 창을 찾지 못해 복구를 시도합니다.")
@@ -2102,21 +2319,29 @@ def send_message(name: str, message: str, dry_run: bool = False) -> bool:
             check_stop_requested()
             suffix = f" (재시도 {attempt}/{MAX_SEARCH_ATTEMPTS - 1})" if attempt else ""
             log(f"   -> 📋 검색 중...{suffix}")
-            search_ok = search_friend(search_term)
+            with time_stage('search'):
+                search_ok = search_friend(search_term)
             if not search_ok:
                 log("   -> ⚠️ 검색창 입력 검증에 실패했지만 AX로 추가 확인을 시도합니다.")
-            safe_sleep((0.8, 1.2))  # 검색 결과 로딩 대기 (랜덤, 중단 체크 포함)
+            with time_stage('search_result_wait'):
+                if current_fast_mode:
+                    _ax_wait_for_search_results(timeout=1.2)  # 결과 행 등장까지 폴링
+                else:
+                    safe_sleep((0.8, 1.2))  # 검색 결과 로딩 대기 (랜덤, 중단 체크 포함)
 
             # 친구 검증: 접근성(AX) API (창 크기와 무관하게 정확한 문자열 비교)
             check_stop_requested()
-            if verify_friend_by_ax(name):
+            with time_stage('verify_ax'):
+                _ax_verified = verify_friend_by_ax(name)
+            if _ax_verified:
                 verified = True
                 break
 
             if attempt < MAX_SEARCH_ATTEMPTS - 1:
                 log("   -> ↻ 검색을 한 번 더 시도합니다.")
                 reset_search(silent=True)
-                safe_sleep((0.5, 1.0))
+                if not current_fast_mode:
+                    safe_sleep((0.5, 1.0))
 
         if not verified:
             if is_emoji_name:
@@ -2134,8 +2359,13 @@ def send_message(name: str, message: str, dry_run: bool = False) -> bool:
             log(f"   -> 🧪 (모의 전송) 채팅방 열고 1초 후 닫음 — 실제 메시지는 보내지 않음")
             open_chat_then_close(wait_seconds=1.0)
             return True
-        send_message_to_friend(message)
-        safe_sleep((0.3, 0.8))  # 전송 후 대기 (랜덤, 중단 체크 포함)
+        with time_stage('send_total'):
+            send_message_to_friend(message)
+        with time_stage('post_send_wait'):
+            if current_fast_mode:
+                check_stop_requested()  # 패스트: 탐지방지 대기 제거(⚠️스팸 위험), 중단만 확인
+            else:
+                safe_sleep((0.3, 0.8))  # 전송 후 대기 (랜덤, 중단 체크 포함)
         log(f"   -> ✅ 전송 완료!")
         return True
         
@@ -2149,7 +2379,8 @@ def send_message(name: str, message: str, dry_run: bool = False) -> bool:
         # 성공/실패 관계없이 다음 검색을 위해 검색창 초기화 (중단 요청이 아닌 경우에만)
         if not stop_requested:
             try:
-                reset_search(silent=True)
+                with time_stage('reset_search'):
+                    reset_search(silent=True)
                 # 중단 요청이 없을 때만 대기
                 if not stop_requested:
                     time.sleep(random.uniform(0.2, 0.5))
@@ -2163,8 +2394,11 @@ def run_sending_logic():
     import json
     
     try:
+        reset_timing()  # B(계측): 이전 실행 기록 초기화
         if current_dry_run:
             log("🧪 모의 전송(테스트) 모드 — 친구 검증까지만 수행하며 실제 메시지는 전송되지 않습니다.")
+        if current_fast_mode:
+            log("⚡ 패스트 모드 ON — 대기 최소화로 빠르게 보냅니다. ⚠️ 빠른 연속 발송은 카카오톡 스팸/매크로 탐지로 계정이 제한될 수 있습니다.")
         df = pd.read_excel(current_file_path)
         log(f"📊 전체 {len(df)}명 로드됨")
         
@@ -2303,9 +2537,12 @@ def run_sending_logic():
             message = message_template.format(name=name)
             
             log(f"[{i + 1}/{count}] {name}님 처리 중...")
-            
+            set_timing_context(i + 1, name)  # B(계측): 이번 대상자 컨텍스트
+
             try:
-                if send_message(name, message, dry_run=current_dry_run):
+                with time_stage('person_total'):
+                    sent_ok = send_message(name, message, dry_run=current_dry_run)
+                if sent_ok:
                     success_count += 1
                 else:
                     failed_names.append(name)
@@ -2315,9 +2552,11 @@ def run_sending_logic():
                 break
             
             # 매크로 탐지 방지를 위한 랜덤 대기 (1~3초, 중단 체크 포함)
+            # 패스트 모드는 이 대기를 제거한다(⚠️스팸/매크로 탐지로 계정 제한 위험).
             check_stop_requested()
             try:
-                safe_sleep((1.0, 3.0), show_log=True)
+                if not current_fast_mode:
+                    safe_sleep((1.0, 3.0), show_log=True)
             except StopRequestedException:
                 log(f"\n⚠️ 사용자에 의해 전송이 중단되었습니다. ({i + 1}/{count} 처리됨)")
                 stopped = True
@@ -2335,7 +2574,12 @@ def run_sending_logic():
                 log(f"   • {name}")
         
         log(f"{'='*40}")
-        
+
+        try:
+            dump_timing_summary()  # B(계측): 단계별 소요시간 요약 + CSV 덤프
+        except Exception:
+            pass
+
         log_queue.put(json.dumps({
             'type': 'complete',
             'success': success_count,
