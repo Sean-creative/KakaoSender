@@ -63,12 +63,16 @@ except Exception:
 # ============================================================
 # 설정
 # ============================================================
-VERSION = "1.0.18"
+VERSION = "1.0.19"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 카카오톡 자동화 튜닝 (다른 맥에서 검색/채팅 진입 안정화)
 SEARCH_RESULT_DOWN_ARROW_COUNT = 2
 MAX_SEARCH_ATTEMPTS = 2
 SEARCH_INPUT_VERIFY_ATTEMPTS = 2
+# 부분(접두) 일치 허용 최소 길이(공백 제외). 카톡 표시이름에 '…30대 남' 같은 꼬리표가
+# 더 붙은 경우, 엑셀의 짧은 이름이 카톡 이름에 '포함'되면 인정한다. 단 너무 짧은 이름이
+# 광범위하게 오매칭되지 않도록 이 길이 이상일 때만, 그리고 후보가 정확히 1명일 때만 허용한다.
+SUBSTRING_MATCH_MIN_CHARS = 4
 # 친구 검증은 접근성(AX) API로만 수행한다. (정확한 문자열 비교 → 오발송 방지)
 USE_AX_VERIFICATION = True
 # 검색어/메시지 입력과 전송을 접근성(AX) API로 처리(키보드 비의존). 실패 시 키 입력으로 폴백.
@@ -319,6 +323,11 @@ def normalize_name_for_match(name: str) -> str:
     (카카오톡 표시 이름에 붙은 이모티콘 '홍길동🍪' 등을 떼고 비교하기 위함)"""
     text = EMOJI_PATTERN.sub('', str(name))
     return normalize_name(text)
+
+
+def comparable_name_length(name: str) -> int:
+    """공백을 제외한 비교용 이름 길이 (부분 일치 허용 최소 길이 판정용)."""
+    return len(re.sub(r'\s+', '', str(name)))
 
 
 def name_contains_emoji_or_symbol(name: str) -> bool:
@@ -890,7 +899,6 @@ def verify_friend_by_ax(name: str) -> bool:
             return False
 
         # 2) 장식기호(이모티콘) 제거 후 일치 — 카카오톡 표시 이름에 이모티콘이 붙은 경우.
-        #    (부분 일치 같은 퍼지 매칭은 AX 정확 읽기에선 불필요하고 오발송 위험이라 두지 않는다.)
         decorated_matches = {n for n in names if normalize_name_for_match(n) == decorated_normalized}
         if len(decorated_matches) == 1:
             log(f"   -> ✅ AX(장식기호 제거) 확인됨: '{next(iter(decorated_matches))}'")
@@ -898,6 +906,22 @@ def verify_friend_by_ax(name: str) -> bool:
         if len(decorated_matches) > 1:
             log(f"   -> ⚠️ AX 후보가 여러 개라 오발송 방지를 위해 보류: {', '.join(decorated_matches)}")
             return False
+
+        # 3) 부분 일치 — 카톡 표시이름에 '…30대 남' 같은 꼬리표가 더 붙어 엑셀 이름이 그 일부인 경우.
+        #    오발송 방지를 위해: 충분히 긴 이름에 한해, 검색 결과 중 '정확히 한 명'의 이름에
+        #    포함될 때만 인정한다. 후보가 2명 이상이면 보류(어느 쪽인지 확신 불가).
+        if comparable_name_length(decorated_normalized) >= SUBSTRING_MATCH_MIN_CHARS:
+            substring_matches = [
+                n for n in names
+                if normalize_name_for_match(n) != decorated_normalized
+                and decorated_normalized in normalize_name_for_match(n)
+            ]
+            if len(substring_matches) == 1:
+                log(f"   -> ✅ AX(부분 일치) 확인됨: '{substring_matches[0]}' ⊇ '{normalize_name(name)}'")
+                return True
+            if len(substring_matches) > 1:
+                log(f"   -> ⚠️ 부분 일치 후보가 여러 개라 오발송 방지를 위해 보류: {', '.join(substring_matches)}")
+                return False
 
         return False
     except Exception as exc:
