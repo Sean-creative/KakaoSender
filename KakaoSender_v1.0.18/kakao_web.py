@@ -63,7 +63,7 @@ except Exception:
 # ============================================================
 # 설정
 # ============================================================
-VERSION = "1.0.17"
+VERSION = "1.0.18"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 카카오톡 자동화 튜닝 (다른 맥에서 검색/채팅 진입 안정화)
 SEARCH_RESULT_DOWN_ARROW_COUNT = 2

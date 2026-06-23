@@ -40,55 +40,35 @@ source "$VENV_DIR/bin/activate"
 # 필요한 패키지 확인 및 설치
 echo "📦 필요한 패키지 확인 중..."
 
-# 기본 패키지 확인
-python3 -c "import pandas, pyperclip, flask" 2>/dev/null
-BASIC_OK=$?
+# 앱이 실제로 사용하는 모든 패키지를 한 번에 확인한다.
+#  - 엑셀 읽기에 openpyxl이 필요하므로 반드시 포함해야 한다(누락 시 '.xlsx 읽기' 에러).
+#  - 친구 검증/입력/이미지는 접근성(AX)·AppKit 기반(AppKit, ApplicationServices).
+#  - (구버전의 Quartz/Vision은 더 이상 사용하지 않으므로 설치/확인하지 않는다.)
+REQUIRED_IMPORTS="import pandas, openpyxl, pyperclip, flask, AppKit, ApplicationServices"
+python3 -c "$REQUIRED_IMPORTS" 2>/dev/null
+DEPS_OK=$?
 
-# OCR 패키지 확인 (친구 검증용)
-python3 -c "import Quartz, Vision" 2>/dev/null
-OCR_OK=$?
-
-# 접근성(AX) 패키지 확인 (친구 검증 정확도 향상용)
-python3 -c "import AppKit, ApplicationServices" 2>/dev/null
-AX_OK=$?
-
-if [ $BASIC_OK -ne 0 ] || [ $OCR_OK -ne 0 ] || [ $AX_OK -ne 0 ]; then
+if [ $DEPS_OK -ne 0 ]; then
     echo "📥 패키지 설치 중... (최초 1회만 필요, 수 분 소요)"
     echo ""
-    
-    # pip 업그레이드
+
     pip3 install --upgrade pip --quiet
-    
-    if [ $BASIC_OK -ne 0 ]; then
-        echo "   - 기본 패키지 설치 중..."
-        pip3 install pandas pyperclip openpyxl flask --quiet
-        if [ $? -ne 0 ]; then
-            echo "❌ 기본 패키지 설치에 실패했습니다."
-            read -p "아무 키나 누르면 종료합니다..."
-            exit 1
-        fi
+    pip3 install pandas openpyxl pyperclip flask pyobjc-framework-Cocoa pyobjc-framework-ApplicationServices --quiet
+    if [ $? -ne 0 ]; then
+        echo "❌ 패키지 설치에 실패했습니다. 인터넷 연결을 확인하고 다시 실행해주세요."
+        read -p "아무 키나 누르면 종료합니다..."
+        exit 1
     fi
-    
-    if [ $OCR_OK -ne 0 ]; then
-        echo "   - OCR 패키지 설치 중... (시간이 다소 걸립니다)"
-        pip3 install pyobjc-framework-Quartz pyobjc-framework-Vision --quiet
-        if [ $? -ne 0 ]; then
-            echo "❌ OCR 패키지 설치에 실패했습니다."
-            read -p "아무 키나 누르면 종료합니다..."
-            exit 1
-        fi
+
+    # 설치 후 재확인 (부분 설치 방지)
+    python3 -c "$REQUIRED_IMPORTS" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo "❌ 일부 패키지가 여전히 누락되었습니다. 다시 실행하거나 아래를 직접 설치해주세요:"
+        echo "   pip3 install pandas openpyxl pyperclip flask pyobjc-framework-Cocoa pyobjc-framework-ApplicationServices"
+        read -p "아무 키나 누르면 종료합니다..."
+        exit 1
     fi
-    
-    if [ $AX_OK -ne 0 ]; then
-        echo "   - 접근성(AX) 패키지 설치 중..."
-        pip3 install pyobjc-framework-Cocoa pyobjc-framework-ApplicationServices --quiet
-        if [ $? -ne 0 ]; then
-            echo "❌ 접근성(AX) 패키지 설치에 실패했습니다."
-            read -p "아무 키나 누르면 종료합니다..."
-            exit 1
-        fi
-    fi
-    
+
     echo ""
     echo "✅ 패키지 설치 완료!"
 fi
