@@ -23,7 +23,6 @@ from typing import Optional, List
 import pandas as pd
 import pyperclip
 from flask import Flask, render_template_string, request, jsonify, Response
-import Quartz
 
 # 접근성(AX) API — 친구 이름을 정확한 문자열로 읽고/입력하기 위한 경로.
 # 카카오톡 조작에 필요한 '손쉬운 사용(접근성)' 권한과 동일한 권한을 사용한다.
@@ -64,11 +63,10 @@ except Exception:
 # ============================================================
 # 설정
 # ============================================================
-VERSION = "1.0.16"
+VERSION = "1.0.17"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 카카오톡 자동화 튜닝 (다른 맥에서 검색/채팅 진입 안정화)
 SEARCH_RESULT_DOWN_ARROW_COUNT = 2
-SUBSTRING_MATCH_MIN_CHARS = 4
 MAX_SEARCH_ATTEMPTS = 2
 SEARCH_INPUT_VERIFY_ATTEMPTS = 2
 # 친구 검증은 접근성(AX) API로만 수행한다. (정확한 문자열 비교 → 오발송 방지)
@@ -80,10 +78,6 @@ USE_AX_INPUT = True
 KAKAO_BUNDLE_IDS = ('com.kakao.KakaoTalkMac', 'com.kakao.KakaoTalk')
 # 검색 결과에서 친구 이름이 담기는 AXStaticText 의 identifier
 AX_DISPLAY_NAME_ID = 'Display Name'
-# AX 검증 실패 시에만 진단용으로 카카오톡 창을 1장 캡처해 저장한다.
-# (화면 녹화 권한이 있을 때만 best-effort로 저장 — 없으면 조용히 건너뜀)
-DEBUG_CAPTURE_ON_FAILURE = True
-DEBUG_CAPTURE_DIR = os.path.join(tempfile.gettempdir(), 'kakao_sender_debug_captures')
 CHAT_DELAY_BEFORE_ENTER = 0.55
 CHAT_DELAY_AFTER_ENTER = 1.35
 # 업로드 파일은 스크립트 폴더가 아닌 시스템 임시 디렉터리에 저장 (폴더명 공백·복사본 경로 등으로 인한 ENOENT 방지)
@@ -103,7 +97,7 @@ _timing_ctx = {'idx': None, 'name': None}
 # 단계 출력 순서(요약 표 정렬용)
 TIMING_STAGE_ORDER = [
     'ensure_ready', 'search', 'search_result_wait', 'verify_ax',
-    'open_chat', 'layout_wait', 'ax_input_send', 'close_chat',
+    'open_chat', 'layout_wait', 'image_send', 'ax_input_send', 'close_chat',
     'send_total', 'post_send_wait', 'reset_search', 'person_total',
 ]
 
@@ -244,6 +238,10 @@ current_dry_run = False  # 모의 전송(테스트) 모드: 실제 메시지 발
 # 매크로 탐지 방지용 대기(대상 간/전송 후)를 제거한다.
 # ⚠️ 빠른 연속 발송은 카카오톡 스팸/매크로 탐지로 계정이 제한될 수 있다.
 current_fast_mode = False
+# 이미지 첨부(선택, 1장). current_image_path가 있으면 텍스트와 함께 전송한다.
+# current_image_order: 'image_first'(기본, 사진 먼저) | 'text_first'(텍스트 먼저)
+current_image_path = None
+current_image_order = 'image_first'
 
 
 def fast_delay(normal: float, fast: float) -> float:
@@ -316,15 +314,11 @@ def normalize_name(name: str) -> str:
     return re.sub(r'\s+', ' ', str(name)).strip()
 
 
-def normalize_name_for_ocr_match(name: str) -> str:
-    """장식기호 제거 비교용 이름 정규화: 이모티콘/장식 기호 제거 + 공백 정리."""
+def normalize_name_for_match(name: str) -> str:
+    """이름 매칭용 정규화: 이모티콘/장식 기호 제거 + 공백 정리.
+    (카카오톡 표시 이름에 붙은 이모티콘 '홍길동🍪' 등을 떼고 비교하기 위함)"""
     text = EMOJI_PATTERN.sub('', str(name))
     return normalize_name(text)
-
-
-def comparable_name_length(name: str) -> int:
-    """공백을 제외한 비교용 이름 길이."""
-    return len(re.sub(r'\s+', '', name))
 
 
 def name_contains_emoji_or_symbol(name: str) -> bool:
@@ -351,7 +345,7 @@ def name_for_search(name: str) -> str:
     (최종 친구 식별은 이모티콘까지 포함한 정확 일치로 별도 수행 → 오발송 방지)
     """
     if name_contains_emoji_or_symbol(name):
-        stripped = normalize_name_for_ocr_match(name)
+        stripped = normalize_name_for_match(name)
         if stripped:
             return stripped
     return name
@@ -392,106 +386,42 @@ end tell
 
 
 # ============================================================
-# 카카오톡 창 헬퍼 함수
+# 카카오톡 활성화 헬퍼 (검증·전송은 AX 기반 — Quartz 창 탐지/캡처는 사용하지 않음)
 # ============================================================
-def get_kakaotalk_window_id():
-    """카카오톡 창 ID 가져오기"""
-    options = Quartz.kCGWindowListOptionOnScreenOnly
-    window_list = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID)
-    
-    candidates = []
-    for window in window_list:
-        owner_name = window.get('kCGWindowOwnerName', '')
-        window_id = window.get('kCGWindowNumber', 0)
-        bounds = window.get('kCGWindowBounds', {})
-        
-        # 카카오톡 & 어느정도 크기가 있는 메인창
-        if 'KakaoTalk' in owner_name or '카카오톡' in owner_name:
-            if bounds.get('Width', 0) > 200 and bounds.get('Height', 0) > 200:
-                candidates.append(window_id)
-                
-    return candidates[0] if candidates else None
-
-
-def wait_for_kakaotalk_window(timeout: float = 3.0, interval: float = 0.3) -> Optional[int]:
-    """UI 전환 중 잠깐 사라지는 카카오톡 창이 다시 잡힐 때까지 대기."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        window_id = get_kakaotalk_window_id()
-        if window_id:
-            return window_id
-        time.sleep(interval)
-    return get_kakaotalk_window_id()
-
-
-def save_window_screenshot(window_id: int, label: str) -> Optional[str]:
-    """진단용으로 카카오톡 창 캡처를 PNG로 저장. 실패하면 None 반환.
-    화면 녹화 권한이 없으면 캡처가 비거나 실패하므로 best-effort로 처리한다."""
+def is_kakaotalk_running() -> bool:
+    """카카오톡 앱이 실행 중인지 AX(NSWorkspace)로 확인. 확인 불가 환경이면 True(낙관)."""
+    if not AX_AVAILABLE:
+        return True
     try:
-        os.makedirs(DEBUG_CAPTURE_DIR, exist_ok=True)
-        safe_label = re.sub(r'[^\w가-힣\-]+', '_', str(label), flags=re.UNICODE)[:40] or 'capture'
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        out_path = os.path.join(DEBUG_CAPTURE_DIR, f'{ts}_{safe_label}.png')
-        subprocess.run(
-            ['screencapture', '-l', str(window_id), '-x', out_path],
-            check=False, timeout=5,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            return out_path
+        return _ax_get_kakao_app_element() is not None
     except Exception:
-        return None
-    return None
+        return True
 
 
-def _save_failure_capture(name: str) -> None:
-    """AX 검증 실패 시에만 진단용 캡처를 1장 남긴다(화면 녹화 권한 있을 때만)."""
-    if not DEBUG_CAPTURE_ON_FAILURE:
-        return
-    try:
-        window_id = get_kakaotalk_window_id()
-        if not window_id:
-            return
-        saved = save_window_screenshot(window_id, name)
-        if saved:
-            log(f"   -> 🖼 진단용 캡처 저장됨: {saved}")
-    except Exception:
-        pass
+def ensure_kakaotalk_ready() -> bool:
+    """카카오톡을 활성화하고 최전면으로 올린다(창이 없으면 새 창 시도). 준비되면 True.
 
-
-def ensure_kakaotalk_ready() -> Optional[int]:
-    """카카오톡이 활성화되어 있고 창이 열려있는지 확인, 필요시 재시도"""
-    max_retries = 3
-    
-    for attempt in range(max_retries):
-        # 카카오톡 활성화
-        script = f'''
-        tell application "KakaoTalk"
-            activate
-            delay {fast_delay(0.5, 0.15)}
+    검증·전송은 AX(NSWorkspace 기반)라 창 ID(Quartz)가 필요 없다. 따라서 Quartz 창 탐지는
+    하지 않고, AppleScript로 활성화만 한 뒤 앱 실행 여부를 AX로 확인한다."""
+    script = f'''
+    tell application "KakaoTalk"
+        activate
+        delay {fast_delay(0.5, 0.15)}
+    end tell
+    tell application "System Events"
+        tell process "KakaoTalk"
+            set frontmost to true
+            -- 창이 없으면 새 창 열기 시도
+            if (count of windows) is 0 then
+                keystroke "n" using command down
+                delay {fast_delay(0.5, 0.3)}
+            end if
         end tell
-        tell application "System Events"
-            tell process "KakaoTalk"
-                set frontmost to true
-                -- 창이 없으면 새 창 열기 시도
-                if (count of windows) is 0 then
-                    keystroke "n" using command down
-                    delay {fast_delay(0.5, 0.3)}
-                end if
-            end tell
-        end tell
-        '''
-        run_applescript(script)
-        time.sleep(fast_delay(0.5, 0.1))
-        
-        # 창 확인: 카카오톡 UI 전환 중 일시적으로 창 목록이 비는 경우가 있어 짧게 대기
-        window_id = wait_for_kakaotalk_window(timeout=2.0)
-        if window_id:
-            return window_id
-        
-        time.sleep(1)
-    
-    return None
+    end tell
+    '''
+    run_applescript(script)
+    time.sleep(fast_delay(0.5, 0.1))
+    return is_kakaotalk_running()
 
 
 def _paste_into_search(name: str, use_keystroke: bool) -> None:
@@ -586,11 +516,9 @@ def _paste_into_search(name: str, use_keystroke: bool) -> None:
 
 
 def _read_search_field_text() -> str:
-    """검색창에 들어 있는 텍스트를 읽어옴.
-
-    1순위: 접근성(AX) API로 AXSearchField 값을 직접 읽음 (부수효과 없음, 정확).
-    2순위: 실패 시 기존 방식(클립보드 경유 Cmd+A → Cmd+C)으로 폴백.
-    """
+    """검색창(AXSearchField)에 들어 있는 텍스트를 접근성(AX) API로 직접 읽는다.
+    부수효과 없이 정확하다. 읽지 못하면 빈 문자열을 반환한다.
+    (클립보드 경유 폴백은 제거 — AX 읽기가 신뢰 가능하고 클립보드 오염 위험을 없앤다.)"""
     if AX_AVAILABLE and USE_AX_VERIFICATION:
         try:
             if AXIsProcessTrusted():
@@ -601,24 +529,7 @@ def _read_search_field_text() -> str:
                         return ax_value
         except Exception:
             pass
-
-    script = '''
-    tell application "System Events"
-        tell process "KakaoTalk"
-            set frontmost to true
-            key code 0 using command down
-            delay 0.15
-            key code 8 using command down
-            delay 0.25
-        end tell
-    end tell
-    '''
-    run_applescript(script)
-    time.sleep(0.2)
-    try:
-        return pyperclip.paste() or ""
-    except Exception:
-        return ""
+    return ""
 
 
 def _move_focus_to_search_results() -> None:
@@ -631,7 +542,7 @@ def _move_focus_to_search_results() -> None:
         end tell
         repeat with _k from 1 to {n_down}
             key code 125
-            delay {fast_delay(0.2, 0.1)}
+            delay 0.2
         end repeat
     end tell
     '''
@@ -650,7 +561,9 @@ def search_friend(name: str) -> bool:
     for attempt in range(SEARCH_INPUT_VERIFY_ATTEMPTS):
         use_keystroke = attempt > 0  # 1회차는 메뉴 클릭, 재시도부터 Cmd+V
         _paste_into_search(name, use_keystroke=use_keystroke)
-        time.sleep(fast_delay(0.3, 0.1))
+        # 검색 결과가 로드돼야 아래화살표가 결과를 선택하고 Enter로 채팅방이 열린다.
+        # 이 대기는 채팅방 열기 신뢰성에 직결되므로 패스트 모드라도 줄이지 않는다.
+        time.sleep(0.3)
         actual = normalize_name(_read_search_field_text())
         if actual == expected:
             verified = True
@@ -908,6 +821,21 @@ def _ax_wait_for_message_input(timeout: float = 1.5, interval: float = 0.05) -> 
     return False
 
 
+def _chat_input_ready(timeout: float) -> bool:
+    """채팅방 메시지 입력창이 떴는지(=채팅방이 실제로 열렸는지) 확인.
+
+    AX를 못 쓰는 환경(권한/라이브러리 부재)에서는 확인 수단이 없으므로 True(낙관)로 둬
+    기존 동작을 유지한다. AX 사용 가능하면 입력창 등장까지 폴링한다."""
+    if not (AX_AVAILABLE and USE_AX_INPUT):
+        return True
+    try:
+        if not AXIsProcessTrusted():
+            return True
+    except Exception:
+        return True
+    return _ax_wait_for_message_input(timeout=timeout)
+
+
 def verify_friend_by_ax(name: str) -> bool:
     """접근성(AX) API로 친구 검증. 확인되면 True, 아니면 False.
 
@@ -930,7 +858,7 @@ def verify_friend_by_ax(name: str) -> bool:
             return False
 
         normalized = normalize_name(name)
-        decorated_normalized = normalize_name_for_ocr_match(name)
+        decorated_normalized = normalize_name_for_match(name)
 
         # 오발송 방지 가드: 검색창에 실제로 이 검색어가 들어가 있을 때만 결과를 신뢰한다.
         # (검색 필터가 안 된 채 전체 목록이 보이는 상태에서 우연히 일치해 잘못 보내는 것을 차단)
@@ -939,7 +867,7 @@ def verify_friend_by_ax(name: str) -> bool:
             log("   -> ⚠️ 검색창을 찾지 못해 친구 검증을 보류합니다.")
             return False
         search_normalized = normalize_name(search_value)
-        if search_normalized != normalized and normalize_name_for_ocr_match(search_value) != decorated_normalized:
+        if search_normalized != normalized and normalize_name_for_match(search_value) != decorated_normalized:
             log(
                 f"   -> ⚠️ 검색창 값('{search_normalized[:30]}')이 검색어와 달라 "
                 f"친구 검증을 보류합니다."
@@ -961,25 +889,15 @@ def verify_friend_by_ax(name: str) -> bool:
         if name_contains_emoji_or_symbol(name):
             return False
 
-        # 2) 장식기호 제거 후 일치
-        decorated_matches = {n for n in names if normalize_name_for_ocr_match(n) == decorated_normalized}
+        # 2) 장식기호(이모티콘) 제거 후 일치 — 카카오톡 표시 이름에 이모티콘이 붙은 경우.
+        #    (부분 일치 같은 퍼지 매칭은 AX 정확 읽기에선 불필요하고 오발송 위험이라 두지 않는다.)
+        decorated_matches = {n for n in names if normalize_name_for_match(n) == decorated_normalized}
         if len(decorated_matches) == 1:
             log(f"   -> ✅ AX(장식기호 제거) 확인됨: '{next(iter(decorated_matches))}'")
             return True
         if len(decorated_matches) > 1:
             log(f"   -> ⚠️ AX 후보가 여러 개라 오발송 방지를 위해 보류: {', '.join(decorated_matches)}")
             return False
-
-        # 3) 긴 이름에 한해 단일 부분 일치 허용
-        if comparable_name_length(decorated_normalized) >= SUBSTRING_MATCH_MIN_CHARS:
-            substring_matches = [
-                n for n in names
-                if normalize_name_for_ocr_match(n) != decorated_normalized
-                and decorated_normalized in normalize_name_for_ocr_match(n)
-            ]
-            if len(substring_matches) == 1:
-                log(f"   -> ✅ AX(부분 일치) 확인됨: '{substring_matches[0]}' ⊇ '{decorated_normalized}'")
-                return True
 
         return False
     except Exception as exc:
@@ -1035,17 +953,89 @@ def request_ax_permission_prompt() -> dict:
     return get_ax_permission_state()
 
 
-def send_message_to_friend(message: str):
-    """채팅방에서 메시지 전송 (AX 입력 우선, 실패 시 클립보드 붙여넣기 폴백)."""
-    db = fast_delay(CHAT_DELAY_BEFORE_ENTER, 0.2)
-    # 패스트 모드: Enter 후 레이아웃 대기를 고정 da 대신 '입력창 등장 폴링'으로 처리하므로
-    # AppleScript 내부 da는 짧게 두고, 실제 대기는 아래 layout_wait 폴링이 담당한다.
-    da = fast_delay(CHAT_DELAY_AFTER_ENTER, 0.2)
+def _copy_image_to_clipboard(image_path: str) -> bool:
+    """이미지 파일을 클립보드에 '사진'으로 복사한다. 성공 시 True.
+
+    NSImage로 읽어 클립보드에 이미지 데이터로 올린다(파일 URL이 아니라 이미지 데이터라
+    카카오톡이 '사진'으로 붙여넣는다). pyobjc/AppKit이 없으면 False.
+    """
+    try:
+        from AppKit import NSPasteboard, NSImage
+    except Exception:
+        return False
+    try:
+        img = NSImage.alloc().initWithContentsOfFile_(image_path)
+        if img is None:
+            return False
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        return bool(pb.writeObjects_([img]))
+    except Exception:
+        return False
+
+
+def _send_image_via_clipboard(image_path: str) -> bool:
+    """열린 채팅방에 이미지 1장을 전송한다: 클립보드 복사 → '편집>붙여넣기' 메뉴 클릭 → Enter.
+
+    Cmd+V(키 이벤트)는 채팅 연 직후 '첫 동작'일 때 입력창 포커스 레이스로 붙여넣기가 실패하는
+    경우가 있었다(사진 먼저 순서에서 재현). 그래서 텍스트와 동일하게 '편집>붙여넣기' 메뉴 클릭
+    방식으로 붙여넣는다 — 메뉴 클릭은 첫 동작이어도 안정적으로 입력창에 붙는다.
+    붙여넣기 대기는 이미지 첨부 시간이 텍스트보다 길어 넉넉히 둔다(이미지는 1인당 1회).
+    복사 실패/파일 없음 시 False(텍스트만 전송되도록 호출부에서 처리)."""
+    if not image_path or not os.path.exists(image_path):
+        return False
+    if not _copy_image_to_clipboard(image_path):
+        return False
+    script = '''
+    tell application "KakaoTalk" to activate
+    delay 0.3
+    tell application "System Events"
+        tell process "KakaoTalk"
+            set frontmost to true
+            try
+                click menu item "붙여넣기" of menu "편집" of menu bar 1
+            on error
+                try
+                    click menu item "Paste" of menu "편집" of menu bar 1
+                on error
+                    try
+                        click menu item "Paste" of menu "Edit" of menu bar 1
+                    end try
+                end try
+            end try
+        end tell
+        delay 1.2
+        key code 36
+        delay 0.6
+    end tell
+    '''
+    run_applescript(script)
+    return True
+
+
+def send_message_to_friend(message: str) -> bool:
+    """채팅방에서 메시지(+선택적 이미지 1장) 전송. 전송을 시도했으면 True, 채팅방을
+    열지 못해 전송 불가면 False.
+
+    텍스트: AX 입력 우선(실패 시 클립보드 붙여넣기 폴백).
+    이미지: 클립보드 복사 → 붙여넣기 → Enter.
+    이미지가 있으면 current_image_order('image_first'=사진 먼저 / 'text_first'=텍스트 먼저)
+    순서로 보낸다. (기본: 사진 먼저)
+    """
+    # 이미지 첨부 발송은 정상 모드에서만 안정적으로 검증됐다(패스트에선 즉시 AX 폴링·짧은
+    # 대기가 렌더링 중인 카카오톡의 이미지 붙여넣기를 깨뜨림). 따라서 이미지가 있으면 이
+    # '사람 처리 구간'은 패스트라도 정상 동작으로 수행한다. 패스트의 핵심 이득(대상 간/전송
+    # 후 대기 제거)은 사람 사이에서 일어나므로 대량 속도는 그대로 유지된다.
+    per_send_fast = current_fast_mode and not current_image_path
+
+    # 채팅방 열기(검색결과 선택 → Enter)는 신뢰성이 최우선이라 db/activate 대기는 항상 일반값.
+    db = CHAT_DELAY_BEFORE_ENTER
+    da = 0.3 if per_send_fast else CHAT_DELAY_AFTER_ENTER
 
     # 채팅방 열기
     open_script = f'''
     tell application "KakaoTalk" to activate
-    delay {fast_delay(0.3, 0.15)}
+    delay 0.3
     tell application "System Events"
         tell process "KakaoTalk"
             set frontmost to true
@@ -1055,47 +1045,86 @@ def send_message_to_friend(message: str):
         delay {da}
     end tell
     '''
-    with time_stage('open_chat'):
-        run_applescript(open_script)
 
-    # 채팅방 레이아웃 전환 대기. 패스트 모드는 입력창이 실제로 뜰 때까지 폴링해
-    # (고정 0.8초 대신) 빠르면 즉시 진행하고 느릴 때만 기다린다 → 속도+신뢰성.
-    with time_stage('layout_wait'):
-        if current_fast_mode:
-            _ax_wait_for_message_input(timeout=1.5)
-        else:
-            time.sleep(0.8)
+    def _open_and_check() -> bool:
+        """채팅방 열기 Enter → 입력창이 뜰 때까지 대기/확인. 떴으면 True."""
+        with time_stage('open_chat'):
+            run_applescript(open_script)
+        with time_stage('layout_wait'):
+            if per_send_fast:
+                return _chat_input_ready(timeout=2.0)
+            time.sleep(0.8)  # 렌더링 대기
+            if current_image_path:
+                # 이미지 발송: 정상 모드에서 검증된 경로. 입력창 AX 폴링이 붙여넣기를
+                # 방해하는 정황이 있어, 추가 AX 접근 없이 고정 대기만으로 진행한다.
+                return True
+            return _chat_input_ready(timeout=1.5)  # 일반 텍스트: 입력창 확인(안전망)
 
-    # 1순위: AX로 메시지 입력 + 전송 버튼 AXPress (키보드 비의존, 클립보드 미사용)
-    with time_stage('ax_input_send'):
-        sent_by_ax = _ax_input_and_send(message)
+    # 채팅방이 안 열리는 경우(Enter 미반영 등)를 대비해 1회 재시도하고,
+    # 그래도 입력창이 안 뜨면 허공 전송을 막기 위해 전송하지 않고 False를 반환한다.
+    chat_ready = _open_and_check()
+    if not chat_ready:
+        log("   -> ↻ 채팅방이 열리지 않아 다시 시도합니다...")
+        chat_ready = _open_and_check()
+    if not chat_ready:
+        log("   -> ⚠️ 채팅방을 열지 못해 이 대상은 전송하지 못했습니다. (입력창 미확인)")
+        return False
 
-    # 2순위: AX 실패 시 기존 방식(클립보드 붙여넣기 + Enter)으로 폴백
-    if not sent_by_ax:
-        # 붙여넣기 직전에 복사 — Handoff로 인한 클립보드 오염 위험을 최소화
-        _reliable_copy(message)
-        paste_send_script = '''
-        tell application "System Events"
-            tell process "KakaoTalk"
-                set frontmost to true
-                try
-                    click menu item "붙여넣기" of menu "편집" of menu bar 1
-                on error
+    def _send_text(prefer_clipboard=False):
+        # prefer_clipboard=True(이미지 동반)면 AX를 건너뛰고 클립보드(키보드 붙여넣기)로 보낸다.
+        # AX로 텍스트를 보내면 입력창의 키보드 포커스(first responder)가 풀려, 곧이은 이미지
+        # Cmd+V 붙여넣기가 입력창에 안 들어가 미리보기가 안 뜬다. 키보드 붙여넣기는 포커스를
+        # 유지하므로 이미지 붙여넣기와 호환된다.
+        with time_stage('ax_input_send'):
+            # 1순위: AX 입력(이미지 없을 때만). 성공하면 종료.
+            if not prefer_clipboard and _ax_input_and_send(message):
+                return
+            # 2순위(또는 이미지 동반 시 기본): 클립보드 붙여넣기 + Enter
+            _reliable_copy(message)  # 붙여넣기 직전 복사 — Handoff 오염 최소화
+            paste_send_script = '''
+            tell application "System Events"
+                tell process "KakaoTalk"
+                    set frontmost to true
                     try
-                        click menu item "Paste" of menu "편집" of menu bar 1
+                        click menu item "붙여넣기" of menu "편집" of menu bar 1
                     on error
                         try
-                            click menu item "Paste" of menu "Edit" of menu bar 1
+                            click menu item "Paste" of menu "편집" of menu bar 1
+                        on error
+                            try
+                                click menu item "Paste" of menu "Edit" of menu bar 1
+                            end try
                         end try
                     end try
-                end try
+                end tell
+                delay 0.5
+                key code 36
+                delay 0.5
             end tell
-            delay 0.5
-            key code 36
-            delay 0.5
-        end tell
-        '''
-        run_applescript(paste_send_script)
+            '''
+            run_applescript(paste_send_script)
+
+    def _send_image():
+        # 주의: 붙여넣기→Enter는 전송 트리거이며, 텍스트처럼 '전송 완료'를 확인하지는 못한다.
+        # 여기서 False는 '클립보드 준비 실패'(파일 없음/형식 불가/pyobjc 부재)를 의미한다.
+        with time_stage('image_send'):
+            if not _send_image_via_clipboard(current_image_path):
+                log("   -> ⚠️ 이미지를 클립보드에 준비하지 못해 이미지를 건너뜁니다(텍스트만 전송). 파일/형식을 확인하세요.")
+
+    # 텍스트(+이미지)를 순서대로 전송. 이미지가 있으면 current_image_order를 따른다.
+    # 두 전송 사이엔 앞 전송이 반영될 짧은 정착 간격을 둔다(연속 전송 시 두 번째가 누락되는 것 방지).
+    if current_image_path:
+        # 이미지 동반 시 텍스트도 클립보드(키보드) 방식 → 입력창 포커스 유지로 이미지 붙여넣기 호환
+        if current_image_order == 'text_first':
+            _send_text(prefer_clipboard=True)
+            time.sleep(0.5)
+            _send_image()
+        else:  # 기본: 사진 먼저
+            _send_image()
+            time.sleep(0.5)
+            _send_text(prefer_clipboard=True)
+    else:
+        _send_text()
 
     # 채팅방 닫기 (Esc 2회) — AX/키 입력 경로 공통.
     # 패스트 모드는 직후 reset_search(Esc 3회 + Cmd+1)가 모든 레이어를 닫으므로 생략(중복 제거).
@@ -1114,19 +1143,22 @@ def send_message_to_friend(message: str):
         with time_stage('close_chat'):
             run_applescript(close_script)
 
+    return True
+
 
 def open_chat_then_close(wait_seconds: float = 1.0):
     """[모의 전송용] 선택된 검색 결과의 채팅방을 열고, 잠시 후 닫는다.
 
     메시지 붙여넣기/전송은 하지 않는다. 채팅방 진입·복귀 흐름만 실전과 동일하게 검증한다.
     """
-    db = fast_delay(CHAT_DELAY_BEFORE_ENTER, 0.2)
-    da = fast_delay(CHAT_DELAY_AFTER_ENTER, 0.2)
+    # 채팅방 열기 신뢰성을 위해 db/activate 대기는 일반값 유지(send_message_to_friend와 동일).
+    db = CHAT_DELAY_BEFORE_ENTER
+    da = fast_delay(CHAT_DELAY_AFTER_ENTER, 0.3)
 
     # 채팅방 열기 (Enter)
     open_script = f'''
     tell application "KakaoTalk" to activate
-    delay {fast_delay(0.3, 0.15)}
+    delay 0.3
     tell application "System Events"
         tell process "KakaoTalk"
             set frontmost to true
@@ -1399,6 +1431,69 @@ HTML_TEMPLATE = '''
         .dryrun-label .dryrun-desc {
             color: #8d6e63;
             font-size: 12px;
+        }
+        .image-section {
+            background: #eef6ff;
+            border: 1px solid #bcdcff;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 15px;
+            text-align: left;
+        }
+        .image-pick {
+            display: block;
+            font-size: 14px;
+            font-weight: bold;
+            color: #1c4e80;
+            margin-bottom: 8px;
+        }
+        .image-pick .image-opt {
+            font-weight: normal;
+            font-size: 12px;
+            color: #5a82a8;
+        }
+        .image-section input[type="file"] {
+            font-size: 13px;
+            color: #1c4e80;
+            max-width: 100%;
+        }
+        .image-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .image-info .image-name {
+            font-size: 13px;
+            color: #1c4e80;
+            word-break: break-all;
+        }
+        .image-info .image-remove {
+            border: none;
+            background: #e7f0fb;
+            color: #1c4e80;
+            border-radius: 8px;
+            padding: 4px 10px;
+            font-size: 12px;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        .image-order {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-top: 10px;
+            font-size: 13px;
+            color: #1c4e80;
+        }
+        .image-order .image-order-title {
+            font-weight: bold;
+        }
+        .image-order .image-order-opt {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            cursor: pointer;
         }
         .fastmode-section {
             background: #fdecec;
@@ -1688,6 +1783,21 @@ HTML_TEMPLATE = '''
                 <textarea class="message-textarea" id="messageText">{{ default_message }}</textarea>
             </div>
 
+            <!-- 이미지 첨부 (선택, 1장) -->
+            <div class="image-section">
+                <label class="image-pick" for="imageInput">📷 이미지 첨부 <span class="image-opt">(선택 · 1장)</span></label>
+                <input type="file" id="imageInput" accept="image/*" onchange="handleImageSelect(this)">
+                <div class="image-info" id="imageInfo" style="display:none;">
+                    <span class="image-name" id="imageName"></span>
+                    <button type="button" class="image-remove" onclick="removeImage()">✕ 제거</button>
+                </div>
+                <div class="image-order" id="imageOrderRow" style="display:none;">
+                    <span class="image-order-title">전송 순서</span>
+                    <label class="image-order-opt"><input type="radio" name="imageOrder" value="image_first" checked> 사진 먼저</label>
+                    <label class="image-order-opt"><input type="radio" name="imageOrder" value="text_first"> 텍스트 먼저</label>
+                </div>
+            </div>
+
             <!-- 모의 전송(dry-run) 옵션 -->
             <div class="dryrun-section">
                 <label class="dryrun-label">
@@ -1748,6 +1858,7 @@ HTML_TEMPLATE = '''
         let eventSource = null;
         let isPaused = false;
         let axPollTimer = null;
+        let hasImage = false;
         
         function toggleFilter(btn) {
             btn.classList.toggle('active');
@@ -1879,6 +1990,7 @@ HTML_TEMPLATE = '''
             document.getElementById('stopBtn').textContent = '⏹ 전송 중단';
             document.getElementById('statusBadge').className = 'status-badge status-running';
             document.getElementById('statusBadge').textContent = '전송 중...';
+            setImageControlsEnabled(false);  // 전송 중 이미지 교체 방지(서버도 차단)
 
             // 파일 업로드
             fetch('/upload', {
@@ -1901,7 +2013,9 @@ HTML_TEMPLATE = '''
                             age_groups: ageGroups,
                             message_template: messageText,
                             dry_run: dryRun,
-                            fast_mode: fastMode
+                            fast_mode: fastMode,
+                            attach_image: hasImage,
+                            image_order: getImageOrder()
                         })
                     })
                     .then(r => r.json())
@@ -2024,6 +2138,40 @@ HTML_TEMPLATE = '''
             }
         }
         
+        function handleImageSelect(input) {
+            if (!input.files || !input.files[0]) return;
+            const file = input.files[0];
+            const fd = new FormData();
+            fd.append('image', file);
+            fetch('/upload_image', { method: 'POST', body: fd })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.success) {
+                        hasImage = true;
+                        document.getElementById('imageName').textContent = '📷 ' + (d.filename || file.name);
+                        document.getElementById('imageInfo').style.display = 'flex';
+                        document.getElementById('imageOrderRow').style.display = 'flex';
+                    } else {
+                        alert('이미지 업로드 실패: ' + (d.error || ''));
+                        removeImage();
+                    }
+                })
+                .catch(e => { alert('이미지 업로드 실패: ' + e); removeImage(); });
+        }
+
+        function removeImage() {
+            hasImage = false;
+            document.getElementById('imageInput').value = '';
+            document.getElementById('imageInfo').style.display = 'none';
+            document.getElementById('imageOrderRow').style.display = 'none';
+            fetch('/clear_image', { method: 'POST' }).catch(() => {});
+        }
+
+        function getImageOrder() {
+            const r = document.querySelector('input[name="imageOrder"]:checked');
+            return r ? r.value : 'image_first';
+        }
+
         function copyLog() {
             const logArea = document.getElementById('logArea');
             const lines = logArea.querySelectorAll('.log-line');
@@ -2096,6 +2244,14 @@ HTML_TEMPLATE = '''
             document.getElementById('statusBadge').className = 'status-badge status-idle';
             document.getElementById('statusBadge').textContent = '대기 중';
             isPaused = false;
+            setImageControlsEnabled(true);  // 전송 종료 후 이미지 컨트롤 복구
+        }
+
+        function setImageControlsEnabled(enabled) {
+            const inp = document.getElementById('imageInput');
+            if (inp) inp.disabled = !enabled;
+            const rm = document.querySelector('.image-remove');
+            if (rm) rm.disabled = !enabled;
         }
     </script>
 </body>
@@ -2141,6 +2297,87 @@ def upload_file():
         return jsonify({'success': False, 'error': str(e)})
 
 
+ALLOWED_IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.heic', '.tiff')
+MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 업로드 이미지 상한 (20MB)
+
+
+def _looks_like_image_file(path: str) -> bool:
+    """파일 헤더(매직 바이트)로 실제 이미지인지 확인. 확장자만 신뢰하지 않기 위함."""
+    try:
+        with open(path, 'rb') as fp:
+            head = fp.read(16)
+    except Exception:
+        return False
+    if len(head) < 12:
+        return False
+    return any((
+        head.startswith(b'\x89PNG\r\n\x1a\n'),           # PNG
+        head.startswith(b'\xff\xd8\xff'),                # JPEG
+        head[:4] == b'GIF8',                             # GIF
+        head.startswith(b'BM'),                          # BMP
+        head[:4] == b'RIFF' and head[8:12] == b'WEBP',   # WEBP
+        head[:4] in (b'II*\x00', b'MM\x00*'),            # TIFF
+        head[4:8] == b'ftyp',                            # HEIC/HEIF (ftyp 박스)
+    ))
+
+
+def _remove_temp_image(path) -> None:
+    """임시 이미지 파일을 best-effort로 삭제한다."""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+@app.route('/upload_image', methods=['POST'])
+def upload_image():
+    """첨부 이미지 1장 업로드. OS 임시 폴더에 저장하고 경로를 보관한다."""
+    global current_image_path
+    # 전송 중에는 이미지 교체를 막는다(사람마다 다른 사진이 나가는 사고 방지).
+    if is_running:
+        return jsonify({'success': False, 'error': '전송 중에는 이미지를 변경할 수 없습니다. 전송을 멈춘 뒤 다시 시도하세요.'})
+    try:
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'error': '이미지가 없습니다'})
+        f = request.files['image']
+        if not f.filename:
+            return jsonify({'success': False, 'error': '이미지가 선택되지 않았습니다'})
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in ALLOWED_IMAGE_EXTS:
+            return jsonify({'success': False, 'error': f'지원하지 않는 이미지 형식입니다 ({ext or "확장자 없음"})'})
+        # 크기 제한: 본문 길이로 사전 차단
+        if request.content_length and request.content_length > MAX_IMAGE_BYTES:
+            return jsonify({'success': False, 'error': f'이미지가 너무 큽니다 (최대 {MAX_IMAGE_BYTES // (1024 * 1024)}MB)'})
+        path = os.path.join(tempfile.gettempdir(), f'kakao_sender_image_{os.getpid()}{ext}')
+        f.save(path)
+        # 저장 후 실제 크기/내용 재검증
+        if os.path.getsize(path) > MAX_IMAGE_BYTES:
+            _remove_temp_image(path)
+            return jsonify({'success': False, 'error': f'이미지가 너무 큽니다 (최대 {MAX_IMAGE_BYTES // (1024 * 1024)}MB)'})
+        if not _looks_like_image_file(path):
+            _remove_temp_image(path)
+            return jsonify({'success': False, 'error': '이미지 파일이 아니거나 손상되었습니다'})
+        # 직전 이미지가 다른 경로(다른 확장자)면 정리 후 교체 — 임시파일 누적 방지
+        if current_image_path and current_image_path != path:
+            _remove_temp_image(current_image_path)
+        current_image_path = path
+        return jsonify({'success': True, 'filename': f.filename})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/clear_image', methods=['POST'])
+def clear_image():
+    """첨부 이미지 제거 (임시 파일도 함께 정리)."""
+    global current_image_path
+    if is_running:
+        return jsonify({'success': False, 'error': '전송 중에는 이미지를 변경할 수 없습니다.'})
+    _remove_temp_image(current_image_path)
+    current_image_path = None
+    return jsonify({'success': True})
+
+
 @app.route('/ax_status')
 def ax_status():
     """접근성(AX) 권한 상태 조회 — 프론트의 사전 점검·폴링용."""
@@ -2157,7 +2394,7 @@ def ax_request_permission():
 def start_sending():
     global is_running, stop_requested
     global current_register_types, current_age_groups, current_message_template, current_dry_run
-    global current_fast_mode
+    global current_fast_mode, current_image_path, current_image_order
 
     if is_running:
         return jsonify({'success': False, 'error': '이미 실행 중입니다'})
@@ -2178,6 +2415,10 @@ def start_sending():
     current_message_template = data.get('message_template', DEFAULT_MESSAGE_TEMPLATE)
     current_dry_run = bool(data.get('dry_run', False))
     current_fast_mode = bool(data.get('fast_mode', False))
+    # 이미지 첨부: 순서 옵션 반영. attach_image=False면 이전 실행의 stale 이미지를 해제한다.
+    current_image_order = 'text_first' if data.get('image_order') == 'text_first' else 'image_first'
+    if not data.get('attach_image'):
+        current_image_path = None
 
     is_running = True
     stop_requested = False
@@ -2247,13 +2488,9 @@ def log(msg):
 
 
 def reset_search(silent=False) -> bool:
-    """Esc·친구목록 복귀로 다음 검색을 준비. (AX 검증은 창 크기와 무관하므로 리사이즈하지 않음)"""
+    """Esc·친구목록 복귀로 다음 검색을 준비. (AppleScript Esc+Cmd+1이 복귀를 수행하며,
+    AX 전송엔 창 ID가 불필요하므로 Quartz 창 확인은 하지 않는다.)"""
     run_applescript(_reset_search_script())
-    window_id = wait_for_kakaotalk_window(timeout=3.0)
-    if not window_id:
-        if not silent:
-            log("   -> ⚠️ 다음 검색 준비 중 카카오톡 창 복구 대기 실패")
-        return False
     time.sleep(fast_delay(0.3, 0.1))
     return True
 
@@ -2296,17 +2533,17 @@ def send_message(name: str, message: str, dry_run: bool = False) -> bool:
     try:
         check_stop_requested()
         
-        # 1. 카카오톡 활성화 및 준비 확인
+        # 1. 카카오톡 활성화 및 준비 확인 (검증·전송은 AX 기반)
         with time_stage('ensure_ready'):
-            window_id = ensure_kakaotalk_ready()
+            ready = ensure_kakaotalk_ready()
         check_stop_requested()
-        if not window_id:
-            log(f"   -> ⚠️ 카카오톡 창을 찾지 못해 복구를 시도합니다.")
+        if not ready:
+            log(f"   -> ⚠️ 카카오톡이 준비되지 않아 복구를 시도합니다.")
             reset_search(silent=True)
-            window_id = ensure_kakaotalk_ready()
+            ready = ensure_kakaotalk_ready()
             check_stop_requested()
-            if not window_id:
-                log(f"   -> ❌ 카카오톡 창을 찾을 수 없습니다.")
+            if not ready:
+                log(f"   -> ❌ 카카오톡을 찾을 수 없습니다. (실행/로그인 확인)")
                 return False
 
         # 2~3. 친구 검색 + AX 검증 (검색 화면이 안 떴거나 타이밍 문제일 수 있어 1회 재시도)
@@ -2348,7 +2585,6 @@ def send_message(name: str, message: str, dry_run: bool = False) -> bool:
                 log(f"   -> ❌ '{name}' 친구를 찾을 수 없습니다. (이모티콘 정확 일치 실패 — 카카오톡 표시 이름과 이모티콘까지 동일해야 합니다)")
             else:
                 log(f"   -> ❌ '{name}' 친구를 찾을 수 없습니다. (AX 검증 실패)")
-            _save_failure_capture(name)  # 진단용 캡처 1장(화면 녹화 권한 있을 때만)
             return False
 
         log(f"   -> ✅ 친구 확인됨 (AX)")
@@ -2356,11 +2592,18 @@ def send_message(name: str, message: str, dry_run: bool = False) -> bool:
         # 4. 메시지 전송 (모의 전송 모드면 채팅방만 열었다 닫고 발송은 생략)
         check_stop_requested()
         if dry_run:
-            log(f"   -> 🧪 (모의 전송) 채팅방 열고 1초 후 닫음 — 실제 메시지는 보내지 않음")
+            if current_image_path:
+                order_label = '텍스트 → 사진' if current_image_order == 'text_first' else '사진 → 텍스트'
+                log(f"   -> 🧪 (모의 전송) 실제로는 [{order_label}] 순서로 전송됩니다 — 지금은 채팅방만 열고 닫음")
+            else:
+                log(f"   -> 🧪 (모의 전송) 채팅방 열고 1초 후 닫음 — 실제 메시지는 보내지 않음")
             open_chat_then_close(wait_seconds=1.0)
             return True
         with time_stage('send_total'):
-            send_message_to_friend(message)
+            sent_ok = send_message_to_friend(message)
+        if not sent_ok:
+            # 채팅방을 열지 못해 전송하지 못함 → 실패로 처리(허공 전송 방지)
+            return False
         with time_stage('post_send_wait'):
             if current_fast_mode:
                 check_stop_requested()  # 패스트: 탐지방지 대기 제거(⚠️스팸 위험), 중단만 확인
@@ -2399,6 +2642,9 @@ def run_sending_logic():
             log("🧪 모의 전송(테스트) 모드 — 친구 검증까지만 수행하며 실제 메시지는 전송되지 않습니다.")
         if current_fast_mode:
             log("⚡ 패스트 모드 ON — 대기 최소화로 빠르게 보냅니다. ⚠️ 빠른 연속 발송은 카카오톡 스팸/매크로 탐지로 계정이 제한될 수 있습니다.")
+        if current_image_path:
+            order_label = '텍스트 → 사진' if current_image_order == 'text_first' else '사진 → 텍스트'
+            log(f"📷 이미지 첨부 ON — 전송 순서: {order_label} (사진 1장)")
         df = pd.read_excel(current_file_path)
         log(f"📊 전체 {len(df)}명 로드됨")
         
@@ -2450,7 +2696,7 @@ def run_sending_logic():
 
         # 텍스트 없이 이모티콘/기호만으로 된 이름만 차단 (AX로도 안전한 정확 검증이 불가).
         # 텍스트가 있는 이모티콘 이름(예: '홍길동🍪')은 AX 정확 일치로 안전하게 지원한다.
-        emoji_only_rows = target_df['이름'].apply(lambda x: not normalize_name_for_ocr_match(x))
+        emoji_only_rows = target_df['이름'].apply(lambda x: not normalize_name_for_match(x))
         if emoji_only_rows.any():
             bad_names = target_df.loc[emoji_only_rows, '이름'].unique().tolist()
             names_str = ', '.join(str(x) for x in bad_names)
@@ -2469,9 +2715,9 @@ def run_sending_logic():
         # 전송 시작 전 카카오톡 사전 준비
         log("💬 카카오톡 준비 중...")
         
-        window_id = None
+        kakao_ready = False
         max_prepare_retries = 5  # 최대 5회 시도 (카카오톡이 꺼져있을 경우 시작까지 시간 필요)
-        
+
         for attempt in range(max_prepare_retries):
             run_applescript('''
             tell application "KakaoTalk"
@@ -2489,15 +2735,16 @@ def run_sending_logic():
             end tell
             ''')
             time.sleep(2)
-            
-            window_id = get_kakaotalk_window_id()
-            if window_id:
+
+            # 창 ID(Quartz) 대신 AX로 앱 실행 여부 확인 (검증·전송은 AX 기반)
+            if is_kakaotalk_running():
+                kakao_ready = True
                 break
-            
-            log(f"   -> 카카오톡 창 대기 중... ({attempt + 1}/{max_prepare_retries})")
+
+            log(f"   -> 카카오톡 대기 중... ({attempt + 1}/{max_prepare_retries})")
             time.sleep(2)
-        
-        if not window_id:
+
+        if not kakao_ready:
             log("❌ 카카오톡을 찾을 수 없습니다. 카카오톡이 설치되어 있고 로그인되어 있는지 확인해주세요.")
             log_queue.put(json.dumps({
                 'type': 'complete',
